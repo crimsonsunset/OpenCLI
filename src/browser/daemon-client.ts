@@ -37,13 +37,15 @@ export function generateRunId(): string {
 }
 
 /**
- * Identity of the CLI command run currently driving the browser, attached to
- * every command so the daemon can arbitrate the write lease. Module-level and
- * one-per-invocation, matching `setDaemonCommandTimeoutSeconds`. Null for read
- * and ephemeral commands, which are never lease-arbitrated.
+ * Identity of the CLI command run currently driving the browser. Module-level
+ * and one-per-invocation, matching `setDaemonCommandTimeoutSeconds`.
+ *
+ * `runId` is only set for persistent-session write commands (lease arbitration).
+ * `access` is always set for browser adapter runs so `classifyBrowserError` can
+ * safely retry mid-command detach for reads without risking double-writes.
  */
 export interface DaemonRunContext {
-  runId: string;
+  runId?: string;
   command: string;
   access: 'read' | 'write';
 }
@@ -59,6 +61,7 @@ export function setDaemonRunContext(ctx: DaemonRunContext | null): void {
  * cleanup (an adapter that outlived its CLI timeout settles later): by then a
  * newer run may own the context, and unconditionally nulling it would strip
  * that run's lease heartbeats mid-flight.
+ * @param runId - Lease run id that should own the context being cleared
  */
 export function clearDaemonRunContext(runId: string): void {
   if (_runContext?.runId === runId) _runContext = null;
@@ -383,7 +386,7 @@ async function sendCommandRaw(
       // lease on the persistent site session. The same runId across every exec
       // of one command is the heartbeat that keeps a long-running holder alive.
       ...(_runContext && {
-        runId: _runContext.runId,
+        ...(_runContext.runId ? { runId: _runContext.runId } : {}),
         command: _runContext.command,
         access: _runContext.access,
       }),
@@ -432,7 +435,10 @@ async function sendCommandRaw(
         );
       }
 
-      const advice = classifyBrowserError(new BrowserCommandError(result.error ?? '', result.errorCode));
+      const advice = classifyBrowserError(
+        new BrowserCommandError(result.error ?? '', result.errorCode),
+        { access: _runContext?.access },
+      );
       if (advice.kind === 'extension-transient' && !semanticRetryUsed) {
         semanticRetryUsed = true;
         id = generateId();

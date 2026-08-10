@@ -4,6 +4,7 @@ const DAEMON_WS_URL = `ws://${DAEMON_HOST}:${DAEMON_PORT}/ext`;
 const DAEMON_PING_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}/ping`;
 
 const attached = /* @__PURE__ */ new Set();
+const poisonedTabs = /* @__PURE__ */ new Set();
 const tabFrameContexts = /* @__PURE__ */ new Map();
 const frameTargets = /* @__PURE__ */ new Map();
 const frameTargetKeys = /* @__PURE__ */ new Map();
@@ -35,9 +36,87 @@ function isDebuggableUrl$1(url) {
   if (!url) return true;
   return url.startsWith("http://") || url.startsWith("https://") || url === "about:blank" || url.startsWith("data:");
 }
+async function describeAttachTargets(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const targets = await chrome.debugger.getTargets();
+    const onTab = targets.filter((t) => t.tabId === tabId);
+    const foreignExtOnTab = onTab.filter((t) => typeof t.url === "string" && t.url.startsWith("chrome-extension://") && !t.url.startsWith(`chrome-extension://${chrome.runtime.id}/`));
+    const pageAttachedElsewhere = onTab.some((t) => t.type === "page" && t.attached && !attached.has(tabId));
+    const summary = {
+      tabId,
+      tabUrl: tab.url ?? null,
+      tabStatus: tab.status ?? null,
+      windowId: tab.windowId,
+      attachedCache: attached.has(tabId),
+      poisoned: poisonedTabs.has(tabId),
+      pageAttachedElsewhere,
+      onTabCount: onTab.length,
+      foreignExtOnTabCount: foreignExtOnTab.length,
+      foreignExtOnTab: foreignExtOnTab.slice(0, 20).map((t) => ({
+        type: t.type,
+        attached: t.attached,
+        url: t.url?.slice(0, 180)
+      })),
+      onTab: onTab.slice(0, 20).map((t) => ({
+        type: t.type,
+        attached: t.attached,
+        url: t.url?.slice(0, 160)
+      }))
+    };
+    return JSON.stringify(summary);
+  } catch (err) {
+    return JSON.stringify({
+      tabId,
+      describeError: err instanceof Error ? err.message : String(err)
+    });
+  }
+}
+function markTabPoisoned(tabId, reason) {
+  poisonedTabs.add(tabId);
+  attached.delete(tabId);
+  console.warn(`[opencli:attach] poisoned tab=${tabId} reason=${reason}`);
+}
+async function waitForTabQuiet(tabId, quietMs = 1200, maxMs = 1e4) {
+  const startedAt = Date.now();
+  let quietSince = null;
+  while (Date.now() - startedAt < maxMs) {
+    let status = "unknown";
+    let url = "unknown";
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      status = tab.status ?? "unknown";
+      url = tab.url ?? "unknown";
+    } catch {
+      console.warn(`[opencli:attach] waitForTabQuiet tab gone tab=${tabId}`);
+      return;
+    }
+    if (status === "complete") {
+      if (quietSince === null) quietSince = Date.now();
+      if (Date.now() - quietSince >= quietMs) {
+        console.log(`[opencli:attach] tab quiet tab=${tabId} url=${url} waited=${Date.now() - startedAt}ms`);
+        return;
+      }
+    } else {
+      if (quietSince !== null) {
+        console.log(`[opencli:attach] quiet broken tab=${tabId} status=${status} url=${url}`);
+      }
+      quietSince = null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  console.warn(`[opencli:attach] waitForTabQuiet timed out tab=${tabId} after ${maxMs}ms`);
+}
+function isTabPoisoned(tabId) {
+  return poisonedTabs.has(tabId);
+}
+function clearTabPoison(tabId) {
+  poisonedTabs.delete(tabId);
+}
 async function ensureAttached(tabId, aggressiveRetry = false) {
   try {
     const tab = await chrome.tabs.get(tabId);
+    console.log(`[opencli:attach] begin tab=${tabId} aggressive=${aggressiveRetry} url=${tab.url ?? "unknown"} status=${tab.status ?? "?"} cache=${attached.has(tabId)}`);
     if (!isDebuggableUrl$1(tab.url)) {
       attached.delete(tabId);
       throw new Error(`Cannot debug tab ${tabId}: URL is ${tab.url ?? "unknown"}`);
@@ -53,8 +132,11 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
         expression: "1",
         returnByValue: true
       }, CDP_PROBE_TIMEOUT_MS);
+      console.log(`[opencli:attach] health-check ok tab=${tabId}`);
       return;
-    } catch {
+    } catch (probeErr) {
+      const probeMsg = probeErr instanceof Error ? probeErr.message : String(probeErr);
+      console.warn(`[opencli:attach] health-check failed tab=${tabId}: ${probeMsg}`);
       attached.delete(tabId);
     }
   }
@@ -66,16 +148,31 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     try {
       try {
         await chrome.debugger.detach({ tabId });
-      } catch {
+        console.log(`[opencli:attach] pre-detach ok tab=${tabId} attempt=${attempt}`);
+      } catch (detachErr) {
+        const detachMsg = detachErr instanceof Error ? detachErr.message : String(detachErr);
+        console.log(`[opencli:attach] pre-detach noop tab=${tabId} attempt=${attempt}: ${detachMsg}`);
       }
       await chrome.debugger.attach({ tabId }, "1.3");
+      console.log(`[opencli:attach] attach ok tab=${tabId} attempt=${attempt}/${MAX_ATTACH_RETRIES}`);
       lastError = "";
       break;
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
+      const targets = await describeAttachTargets(tabId);
+      console.warn(`[opencli:attach] attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError} targets=${targets}`);
+      if (lastError.includes("chrome-extension://")) {
+        await stripForeignEmbedsViaContent(tabId);
+      }
       if (attempt < MAX_ATTACH_RETRIES) {
-        console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${RETRY_DELAY_MS}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+        const delayMs = lastError.includes("chrome-extension://") && aggressiveRetry ? 200 : RETRY_DELAY_MS;
+        const maxAttempts = lastError.includes("chrome-extension://") && aggressiveRetry ? Math.min(MAX_ATTACH_RETRIES, 2) : MAX_ATTACH_RETRIES;
+        if (attempt >= maxAttempts) {
+          console.warn(`[opencli:attach] giving up early for content-bridge fallback tab=${tabId}`);
+          break;
+        }
+        console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${delayMs}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
         try {
           const tab = await chrome.tabs.get(tabId);
           if (!isDebuggableUrl$1(tab.url)) {
@@ -97,14 +194,23 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
       finalWindowId = String(tab.windowId);
     } catch {
     }
-    console.warn(`[opencli] attach failed for tab ${tabId}: url=${finalUrl}, windowId=${finalWindowId}, error=${lastError}`);
+    const targets = await describeAttachTargets(tabId);
+    console.error(`[opencli:attach] FAILED tab=${tabId} url=${finalUrl} windowId=${finalWindowId} error=${lastError} targets=${targets}`);
+    if (!aggressiveRetry && (lastError.includes("chrome-extension://") || lastError.includes("Another debugger is already attached"))) {
+      markTabPoisoned(tabId, `attach-failed:${lastError.slice(0, 80)}`);
+    }
     const hint = lastError.includes("chrome-extension://") ? ". Tip: another Chrome extension may be interfering — try disabling other extensions" : "";
-    throw new Error(`attach failed: ${lastError}${hint}`);
+    throw new Error(`attach failed: ${lastError} (tab=${tabId} url=${finalUrl} windowId=${finalWindowId})${hint}`);
   }
   attached.add(tabId);
+  poisonedTabs.delete(tabId);
   try {
+    console.log(`[opencli:attach] Runtime.enable begin tab=${tabId}`);
     await sendDebuggerCommand({ tabId }, "Runtime.enable");
-  } catch {
+    console.log(`[opencli:attach] Runtime.enable ok tab=${tabId}`);
+  } catch (enableErr) {
+    const enableMsg = enableErr instanceof Error ? enableErr.message : String(enableErr);
+    console.warn(`[opencli:attach] Runtime.enable failed tab=${tabId}: ${enableMsg}`);
   }
   if (preservedNetworkCapture) {
     try {
@@ -114,24 +220,115 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     }
   }
 }
-async function evaluate(tabId, expression, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
+async function evaluateOnce(tabId, expression, aggressiveRetry, timeoutMs, startedAt) {
+  await ensureAttached(tabId, aggressiveRetry);
+  console.log(`[opencli:eval] Runtime.evaluate begin tab=${tabId} codeLen=${expression.length} t+${Date.now() - startedAt}ms`);
+  const result = await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: true
+  }, timeoutMs);
+  if (result.exceptionDetails) {
+    const errMsg = result.exceptionDetails.exception?.description || result.exceptionDetails.text || "Eval error";
+    throw new Error(errMsg);
+  }
+  console.log(`[opencli:eval] Runtime.evaluate ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+  return result.result?.value;
+}
+async function stripForeignEmbedsViaContent(tabId) {
   try {
-    await ensureAttached(tabId, aggressiveRetry);
-    const result = await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
-      expression,
-      returnByValue: true,
-      awaitPromise: true
-    }, timeoutMs);
-    if (result.exceptionDetails) {
-      const errMsg = result.exceptionDetails.exception?.description || result.exceptionDetails.text || "Eval error";
-      throw new Error(errMsg);
+    const response = await chrome.tabs.sendMessage(tabId, { type: "opencli:strip-frames" });
+    const removed = response?.removed ?? 0;
+    console.log(`[opencli:attach] content strip-frames tab=${tabId} removed=${removed}`);
+    return removed;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[opencli:attach] content strip-frames unavailable tab=${tabId}: ${msg}`);
+    return 0;
+  }
+}
+async function evaluateViaUserScripts(tabId, expression, startedAt) {
+  if (!chrome.userScripts?.execute) {
+    throw new Error(
+      'userScripts.execute unavailable — enable "Allow User Scripts" on the OpenCLI extension details page, then reload'
+    );
+  }
+  console.warn(`[opencli:eval] userScripts fallback begin tab=${tabId} codeLen=${expression.length} t+${Date.now() - startedAt}ms`);
+  await waitForTabQuiet(tabId, 400, 4e3);
+  await stripForeignEmbedsViaContent(tabId);
+  const results = await chrome.userScripts.execute({
+    target: { tabId },
+    world: "USER_SCRIPT",
+    injectImmediately: true,
+    js: [{ code: expression }]
+  });
+  const injection = results?.[0];
+  if (injection?.error) {
+    throw new Error(String(injection.error));
+  }
+  console.log(`[opencli:eval] userScripts fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+  return injection?.result;
+}
+async function evaluateViaScriptingWorld(tabId, expression, world) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world,
+    args: [expression],
+    func: async (code) => {
+      try {
+        const value = await (0, eval)(code);
+        return { __opencli: true, ok: true, value };
+      } catch (err) {
+        return {
+          __opencli: true,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err)
+        };
+      }
     }
-    return result.result?.value;
+  });
+  const wrapped = injection?.result;
+  if (!wrapped || wrapped.__opencli !== true) {
+    throw new Error("scripting fallback returned no result (likely CSP-blocked eval)");
+  }
+  if (!wrapped.ok) {
+    throw new Error(wrapped.error || "scripting fallback eval failed");
+  }
+  return wrapped.value;
+}
+async function evaluate(tabId, expression, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
+  const startedAt = Date.now();
+  try {
+    return await evaluateOnce(tabId, expression, aggressiveRetry, timeoutMs, startedAt);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("Detached") || msg.includes("Debugger is not attached") || msg.includes("Target closed")) {
-      attached.delete(tabId);
+    console.warn(`[opencli:eval] failed tab=${tabId} t+${Date.now() - startedAt}ms: ${msg}`);
+    const isDetach = msg.includes("Detached") || msg.includes("Debugger is not attached") || msg.includes("Target closed") || msg.includes("attach failed");
+    if (!isDetach) throw e;
+    attached.delete(tabId);
+    if (!aggressiveRetry) {
+      markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
+      throw e;
     }
+    try {
+      return await evaluateViaUserScripts(tabId, expression, startedAt);
+    } catch (userScriptErr) {
+      const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
+      console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+    }
+    if (chrome.scripting?.executeScript) {
+      try {
+        console.warn(`[opencli:eval] scripting fallback begin tab=${tabId}`);
+        await waitForTabQuiet(tabId, 400, 4e3);
+        const value = await evaluateViaScriptingWorld(tabId, expression, "ISOLATED");
+        console.log(`[opencli:eval] scripting fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+        return value;
+      } catch (scriptErr) {
+        const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
+        console.warn(`[opencli:eval] scripting fallback failed tab=${tabId}: ${scriptMsg}`);
+      }
+    }
+    markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
     throw e;
   }
 }
@@ -551,13 +748,21 @@ function registerListeners() {
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     clearFrameTargetsForTab(tabId);
+    clearTabPoison(tabId);
   });
-  chrome.debugger.onDetach.addListener((source) => {
+  chrome.debugger.onDetach.addListener((source, reason) => {
+    console.warn(`[opencli:attach] onDetach tabId=${source.tabId ?? "n/a"} targetId=${source.targetId ?? "n/a"} reason=${reason ?? "unknown"}`);
     if (source.tabId) {
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
+      if (reason === "canceled_by_user") {
+        markTabPoisoned(source.tabId, `onDetach:${reason}`);
+      }
+      void describeAttachTargets(source.tabId).then((targets) => {
+        console.warn(`[opencli:attach] post-detach targets tab=${source.tabId} ${targets}`);
+      });
       return;
     }
     if (source.targetId) clearFrameTarget(source.targetId);
@@ -1015,6 +1220,11 @@ function getSessionFromKey(key) {
   } catch {
     return key.slice(idx + 1);
   }
+}
+function shouldUseAggressiveAttach(leaseKey) {
+  if (getSurfaceFromKey(leaseKey) === "browser") return true;
+  const session = getSessionFromKey(leaseKey);
+  return session === "site:amazon" || session.startsWith("site:amazon:");
 }
 function getIdleTimeout(key) {
   const session = automationSessions.get(key);
@@ -1494,10 +1704,77 @@ async function findReusableOwnedContainerTab(windowId, ownedGroupId) {
 }
 function initialTabIsAvailable(tabId) {
   if (tabId === void 0) return false;
+  if (isTabPoisoned(tabId)) return false;
   for (const session of automationSessions.values()) {
     if (session.owned && session.preferredTabId === tabId) return false;
   }
   return true;
+}
+async function replacePoisonedOwnedTab(leaseKey, poisonedTabId, preferredUrl) {
+  const session = automationSessions.get(leaseKey);
+  if (!session?.owned) {
+    throw new Error(`Cannot replace poisoned tab ${poisonedTabId}: lease is not owned`);
+  }
+  let targetUrl = preferredUrl;
+  if (!targetUrl || !isSafeNavigationUrl(targetUrl)) {
+    try {
+      const old = await chrome.tabs.get(poisonedTabId);
+      if (old.url && isSafeNavigationUrl(old.url)) targetUrl = old.url;
+    } catch {
+    }
+  }
+  if (!targetUrl || !isSafeNavigationUrl(targetUrl)) targetUrl = BLANK_PAGE;
+  console.warn(`[opencli:attach] replacing poisoned tab=${poisonedTabId} lease=${leaseKey} url=${targetUrl}`);
+  const role = getOwnedWindowRole(leaseKey);
+  const tab = await chrome.tabs.create({ windowId: session.windowId, url: targetUrl, active: true });
+  const tabId = tab.id;
+  if (!tabId) throw new Error("Failed to create replacement tab after CDP poison");
+  const group = await ensureOwnedContainerGroup(role, session.windowId, [tabId]);
+  const sessionWindowId = group?.windowId ?? tab.windowId;
+  await new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }, 15e3);
+    const listener = (id, info, tab2) => {
+      if (id !== tabId || info.status !== "complete") return;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      console.log(`[opencli:attach] replacement first-complete tab=${tabId} url=${tab2.url ?? targetUrl}`);
+      resolve();
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    void chrome.tabs.get(tabId).then((tab2) => {
+      if (tab2.status === "complete") {
+        clearTimeout(timeout);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }).catch(() => {
+    });
+  });
+  setLeaseSession(leaseKey, {
+    session: session.session,
+    surface: session.surface,
+    kind: "owned",
+    windowId: sessionWindowId,
+    owned: true,
+    preferredTabId: tabId
+  });
+  resetWindowIdleTimer(leaseKey);
+  try {
+    await chrome.tabs.remove(poisonedTabId);
+  } catch {
+  }
+  const settled = await chrome.tabs.get(tabId);
+  try {
+    await ensureAttached(tabId, true);
+    console.log(`[opencli:attach] replacement pre-attached tab=${tabId}`);
+  } catch (err) {
+    console.warn(`[opencli:attach] replacement pre-attach failed tab=${tabId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  console.log(`[opencli:attach] replacement ready old=${poisonedTabId} new=${tabId} url=${settled.url ?? targetUrl}`);
+  return { tabId, tab: settled };
 }
 async function createOwnedTabLease(leaseKey, initialUrl) {
   return withLeaseMutation(() => createOwnedTabLeaseUnlocked(leaseKey, initialUrl));
@@ -1795,8 +2072,17 @@ function setLeaseSession(leaseKey, session) {
   void persistRuntimeState();
 }
 async function resolveCommandTabId(cmd) {
-  if (cmd.page) return resolveTabId$1(cmd.page);
-  return void 0;
+  if (!cmd.page) return void 0;
+  try {
+    return await resolveTabId$1(cmd.page);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("stale page identity") || msg.includes("Page not found:")) {
+      console.warn(`[opencli:attach] stale page identity ${cmd.page}; falling back to lease`);
+      return void 0;
+    }
+    throw err;
+  }
 }
 async function resolveTab(tabId, leaseKey, initialUrl) {
   const existingSession = automationSessions.get(leaseKey);
@@ -1805,7 +2091,12 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
       const tab = await chrome.tabs.get(tabId);
       const session = existingSession;
       const matchesSession = session ? session.preferredTabId !== null ? session.preferredTabId === tabId : tab.windowId === session.windowId : false;
-      if (isDebuggableUrl(tab.url) && matchesSession) return { tabId, tab };
+      if (isDebuggableUrl(tab.url) && matchesSession) {
+        if (session?.owned && isTabPoisoned(tabId)) {
+          return replacePoisonedOwnedTab(leaseKey, tabId, initialUrl ?? tab.url);
+        }
+        return { tabId, tab };
+      }
       if (session && !session.owned) {
         throw new CommandFailure(
           matchesSession ? "bound_tab_not_debuggable" : "bound_tab_mismatch",
@@ -1845,7 +2136,12 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
     const session = existingSession;
     try {
       const preferredTab = await chrome.tabs.get(existingPreferredTabId);
-      if (isDebuggableUrl(preferredTab.url)) return { tabId: preferredTab.id, tab: preferredTab };
+      if (isDebuggableUrl(preferredTab.url)) {
+        if (session.owned && isTabPoisoned(existingPreferredTabId)) {
+          return replacePoisonedOwnedTab(leaseKey, existingPreferredTabId, initialUrl ?? preferredTab.url);
+        }
+        return { tabId: preferredTab.id, tab: preferredTab };
+      }
       if (!session.owned) {
         throw new CommandFailure(
           "bound_tab_not_debuggable",
@@ -1952,7 +2248,8 @@ async function handleExec(cmd, leaseKey) {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const aggressive = getSurfaceFromKey(leaseKey) === "browser";
+    const aggressive = shouldUseAggressiveAttach(leaseKey);
+    console.log(`[opencli:exec] start lease=${leaseKey} tab=${tabId} aggressive=${aggressive} frameIndex=${cmd.frameIndex ?? "main"} codeLen=${cmd.code.length}`);
     if (cmd.frameIndex != null) {
       const tree = await getFrameTree(tabId);
       const frames = enumerateCrossOriginFrames(tree);
@@ -1989,10 +2286,13 @@ async function handleNavigate(cmd, leaseKey) {
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
+  console.log(`[opencli:nav] start lease=${leaseKey} tab=${tabId} from=${beforeTab.url ?? "unknown"} to=${targetUrl} status=${beforeTab.status ?? "?"} capture=${hasActiveNetworkCapture(tabId)}`);
   if (beforeTab.status === "complete" && isTargetUrl(beforeTab.url, targetUrl)) {
+    console.log(`[opencli:nav] fast-path already-at-target tab=${tabId} url=${beforeTab.url}`);
     return pageScopedResult(cmd.id, tabId, { title: beforeTab.title, url: beforeTab.url, timedOut: false });
   }
   if (!hasActiveNetworkCapture(tabId)) {
+    console.log(`[opencli:nav] pre-nav detach tab=${tabId}`);
     await detach(tabId);
   }
   await chrome.tabs.update(tabId, { url: targetUrl });
@@ -2035,6 +2335,14 @@ async function handleNavigate(cmd, leaseKey) {
     }, 15e3);
   });
   let tab = await chrome.tabs.get(tabId);
+  console.log(`[opencli:nav] settled tab=${tabId} url=${tab.url ?? "unknown"} status=${tab.status ?? "?"} timedOut=${timedOut}`);
+  if (shouldUseAggressiveAttach(leaseKey) && !timedOut) {
+    console.log(`[opencli:nav] post-complete quiet wait tab=${tabId}`);
+    await waitForTabQuiet(tabId, 800, 8e3);
+    await stripForeignEmbedsViaContent(tabId);
+    tab = await chrome.tabs.get(tabId);
+    console.log(`[opencli:nav] post-quiet tab=${tabId} url=${tab.url ?? "unknown"} status=${tab.status ?? "?"}`);
+  }
   const postNavigationSession = automationSessions.get(leaseKey);
   if (postNavigationSession && tab.windowId !== postNavigationSession.windowId) {
     console.warn(`[opencli] Tab ${tabId} drifted to window ${tab.windowId} during navigation, moving back to ${postNavigationSession.windowId}`);
@@ -2223,7 +2531,7 @@ async function handleCdp(cmd, leaseKey) {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const aggressive = getSurfaceFromKey(leaseKey) === "browser";
+    const aggressive = shouldUseAggressiveAttach(leaseKey);
     await ensureAttached(tabId, aggressive);
     const params = cmd.cdpParams ?? {};
     const routeFrameId = typeof params.frameId === "string" && params.sessionId === "target" ? params.frameId : void 0;

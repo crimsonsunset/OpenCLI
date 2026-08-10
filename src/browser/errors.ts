@@ -81,16 +81,28 @@ const ERROR_CODE_ADVICE: Record<string, RetryAdvice> = {
   cdp_timeout: { kind: 'non-retryable', retryable: false, delayMs: 0 },
 };
 
+/** Optional context that can widen retry advice for safe cases (e.g. reads). */
+export interface ClassifyBrowserErrorContext {
+  access?: 'read' | 'write';
+}
+
 /**
  * Classify a browser error and return retry advice.
  *
  * Single source of truth for "is this error transient?" across all layers.
  * Prefers the machine-readable `code` carried by BrowserCommandError; falls
  * back to message patterns for legacy extensions.
+ *
+ * `detached_mid_command` stays non-retryable for writes (outcome unknown —
+ * could double-apply). For reads, a retry is safe and recovers Amazon `/dp`
+ * target-churn that detaches mid settle/eval.
  */
-export function classifyBrowserError(err: unknown): RetryAdvice {
+export function classifyBrowserError(err: unknown, ctx?: ClassifyBrowserErrorContext): RetryAdvice {
   const code = err && typeof err === 'object' ? (err as { code?: unknown }).code : undefined;
   if (typeof code === 'string' && ERROR_CODE_ADVICE[code]) {
+    if (code === 'detached_mid_command' && ctx?.access === 'read') {
+      return { kind: 'extension-transient', retryable: true, delayMs: 1500 };
+    }
     return ERROR_CODE_ADVICE[code];
   }
 

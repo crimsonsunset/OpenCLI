@@ -620,6 +620,45 @@ describe('background tab isolation', () => {
     expect(evaluateAsync).toHaveBeenLastCalledWith(1, '1', false, 10_000);
   });
 
+  it('uses aggressive attach for Amazon adapter sessions but not other adapters', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const evaluateAsync = vi.fn(async () => 'main-result');
+    vi.doMock('./cdp', () => ({
+      registerListeners: vi.fn(),
+      registerFrameTracking: vi.fn(),
+      hasActiveNetworkCapture: vi.fn(() => false),
+      detach: vi.fn(async () => {}),
+      evaluateAsync,
+      evaluateInFrame: vi.fn(),
+      getFrameTree: vi.fn(),
+      screenshot: vi.fn(),
+      setFileInputFiles: vi.fn(),
+      insertText: vi.fn(),
+      startNetworkCapture: vi.fn(),
+      readNetworkCapture: vi.fn(async () => []),
+      ensureAttached: vi.fn(),
+    }));
+
+    const mod = await import('./background');
+    expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:amazon:abc'))).toBe(true);
+    expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:amazon'))).toBe(true);
+    expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:twitter:abc'))).toBe(false);
+    expect(mod.__test__.shouldUseAggressiveAttach(browserKey('main'))).toBe(true);
+
+    mod.__test__.setAutomationWindowId(adapterKey('site:amazon:abc'), 1);
+    await mod.__test__.handleCommand({
+      id: 'amazon-exec',
+      action: 'exec',
+      code: '1',
+      session: 'site:amazon:abc',
+      surface: 'adapter',
+      timeout: 120,
+    });
+    expect(evaluateAsync).toHaveBeenLastCalledWith(1, '1', true, 115_000);
+  });
+
   it('creates new tabs inside the automation container', async () => {
     const { chrome, create } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
