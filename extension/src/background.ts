@@ -423,6 +423,17 @@ function getSessionFromKey(key: string): string {
   }
 }
 
+/**
+ * Whether CDP attach should use the aggressive retry profile (5×1500ms).
+ * Browser-surface commands always do. Amazon adapter sessions also do —
+ * `/dp` navigations routinely outlast the weak adapter profile (2×500ms).
+ */
+function shouldUseAggressiveAttach(leaseKey: string): boolean {
+  if (getSurfaceFromKey(leaseKey) === 'browser') return true;
+  const session = getSessionFromKey(leaseKey);
+  return session === 'site:amazon' || session.startsWith('site:amazon:');
+}
+
 function getIdleTimeout(key: string): number {
   const session = automationSessions.get(key);
   if (session?.kind === 'bound') return IDLE_TIMEOUT_NONE;
@@ -1073,10 +1084,94 @@ async function findReusableOwnedContainerTab(windowId: number, ownedGroupId?: nu
 
 function initialTabIsAvailable(tabId: number | undefined): tabId is number {
   if (tabId === undefined) return false;
+  if (executor.isTabPoisoned(tabId)) return false;
   for (const session of automationSessions.values()) {
     if (session.owned && session.preferredTabId === tabId) return false;
   }
   return true;
+}
+
+/**
+ * Replace an owned lease's CDP-poisoned tab with a fresh one at the same URL.
+ * Amazon /dp routinely fires target_closed mid-eval; Chrome then leaves the
+ * page target `attached:true` while refusing our detach/attach with a misleading
+ * chrome-extension:// error. Retrying the same tab never recovers — swap it.
+ */
+async function replacePoisonedOwnedTab(
+  leaseKey: string,
+  poisonedTabId: number,
+  preferredUrl?: string,
+): Promise<ResolvedTab> {
+  const session = automationSessions.get(leaseKey);
+  if (!session?.owned) {
+    throw new Error(`Cannot replace poisoned tab ${poisonedTabId}: lease is not owned`);
+  }
+
+  let targetUrl = preferredUrl;
+  if (!targetUrl || !isSafeNavigationUrl(targetUrl)) {
+    try {
+      const old = await chrome.tabs.get(poisonedTabId);
+      if (old.url && isSafeNavigationUrl(old.url)) targetUrl = old.url;
+    } catch { /* tab may already be gone */ }
+  }
+  if (!targetUrl || !isSafeNavigationUrl(targetUrl)) targetUrl = BLANK_PAGE;
+
+  console.warn(`[opencli:attach] replacing poisoned tab=${poisonedTabId} lease=${leaseKey} url=${targetUrl}`);
+
+  const role = getOwnedWindowRole(leaseKey);
+  const tab = await chrome.tabs.create({ windowId: session.windowId, url: targetUrl, active: true });
+  const tabId = tab.id;
+  if (!tabId) throw new Error('Failed to create replacement tab after CDP poison');
+  const group = await ensureOwnedContainerGroup(role, session.windowId, [tabId]);
+  const sessionWindowId = group?.windowId ?? tab.windowId;
+
+  // Wait only for the first `complete` — do NOT wait for a quiet period.
+  // Quiet-wait loses the chrome.debugger race to other extensions on /dp.
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }, 15_000);
+    const listener = (id: number, info: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => {
+      if (id !== tabId || info.status !== 'complete') return;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      console.log(`[opencli:attach] replacement first-complete tab=${tabId} url=${tab.url ?? targetUrl}`);
+      resolve();
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    void chrome.tabs.get(tabId).then((tab) => {
+      if (tab.status === 'complete') {
+        clearTimeout(timeout);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }).catch(() => {});
+  });
+
+  setLeaseSession(leaseKey, {
+    session: session.session,
+    surface: session.surface,
+    kind: 'owned',
+    windowId: sessionWindowId,
+    owned: true,
+    preferredTabId: tabId,
+  });
+  resetWindowIdleTimer(leaseKey);
+
+  try { await chrome.tabs.remove(poisonedTabId); } catch { /* ignore */ }
+  const settled = await chrome.tabs.get(tabId);
+
+  // Attach immediately on the fresh tab before other extensions claim it.
+  try {
+    await executor.ensureAttached(tabId, true);
+    console.log(`[opencli:attach] replacement pre-attached tab=${tabId}`);
+  } catch (err) {
+    console.warn(`[opencli:attach] replacement pre-attach failed tab=${tabId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  console.log(`[opencli:attach] replacement ready old=${poisonedTabId} new=${tabId} url=${settled.url ?? targetUrl}`);
+  return { tabId, tab: settled };
 }
 
 async function createOwnedTabLease(leaseKey: string, initialUrl?: string): Promise<ResolvedTab> {
@@ -1466,9 +1561,24 @@ function setLeaseSession(
  * Resolve tabId from command's page (targetId).
  * Returns undefined if no page identity is provided.
  */
+/**
+ * Resolve tabId from command page identity, or undefined to fall through to lease.
+ * Stale identities (tab replaced after CDP poison) must not hard-fail — the lease
+ * preferredTabId is the source of truth after replacePoisonedOwnedTab.
+ * @param cmd - Incoming daemon command
+ */
 async function resolveCommandTabId(cmd: Command): Promise<number | undefined> {
-  if (cmd.page) return identity.resolveTabId(cmd.page);
-  return undefined;
+  if (!cmd.page) return undefined;
+  try {
+    return await identity.resolveTabId(cmd.page);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('stale page identity') || msg.includes('Page not found:')) {
+      console.warn(`[opencli:attach] stale page identity ${cmd.page}; falling back to lease`);
+      return undefined;
+    }
+    throw err;
+  }
 }
 
 type ResolvedTab = { tabId: number; tab: chrome.tabs.Tab | null };
@@ -1487,7 +1597,12 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
       const matchesSession = session
         ? (session.preferredTabId !== null ? session.preferredTabId === tabId : tab.windowId === session.windowId)
         : false;
-      if (isDebuggableUrl(tab.url) && matchesSession) return { tabId, tab };
+      if (isDebuggableUrl(tab.url) && matchesSession) {
+        if (session?.owned && executor.isTabPoisoned(tabId)) {
+          return replacePoisonedOwnedTab(leaseKey, tabId, initialUrl ?? tab.url);
+        }
+        return { tabId, tab };
+      }
       if (session && !session.owned) {
         throw new CommandFailure(
           matchesSession ? 'bound_tab_not_debuggable' : 'bound_tab_mismatch',
@@ -1532,7 +1647,12 @@ async function resolveTab(tabId: number | undefined, leaseKey: string, initialUr
     const session = existingSession;
     try {
       const preferredTab = await chrome.tabs.get(existingPreferredTabId);
-      if (isDebuggableUrl(preferredTab.url)) return { tabId: preferredTab.id!, tab: preferredTab };
+      if (isDebuggableUrl(preferredTab.url)) {
+        if (session.owned && executor.isTabPoisoned(existingPreferredTabId)) {
+          return replacePoisonedOwnedTab(leaseKey, existingPreferredTabId, initialUrl ?? preferredTab.url);
+        }
+        return { tabId: preferredTab.id!, tab: preferredTab };
+      }
       if (!session.owned) {
         throw new CommandFailure(
           'bound_tab_not_debuggable',
@@ -1679,7 +1799,8 @@ async function handleExec(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
+    const aggressive = shouldUseAggressiveAttach(leaseKey);
+    console.log(`[opencli:exec] start lease=${leaseKey} tab=${tabId} aggressive=${aggressive} frameIndex=${cmd.frameIndex ?? 'main'} codeLen=${cmd.code.length}`);
     if (cmd.frameIndex != null) {
       const tree = await executor.getFrameTree(tabId);
       const frames = enumerateCrossOriginFrames(tree);
@@ -1733,9 +1854,11 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
+  console.log(`[opencli:nav] start lease=${leaseKey} tab=${tabId} from=${beforeTab.url ?? 'unknown'} to=${targetUrl} status=${beforeTab.status ?? '?'} capture=${executor.hasActiveNetworkCapture(tabId)}`);
 
   // Fast-path: tab is already at the target URL and fully loaded.
   if (beforeTab.status === 'complete' && isTargetUrl(beforeTab.url, targetUrl)) {
+    console.log(`[opencli:nav] fast-path already-at-target tab=${tabId} url=${beforeTab.url}`);
     return pageScopedResult(cmd.id, tabId, { title: beforeTab.title, url: beforeTab.url, timedOut: false });
   }
 
@@ -1748,6 +1871,7 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   // "Inspected target navigated or closed". Resetting here forces a clean
   // re-attach after navigation when capture is not active.
   if (!executor.hasActiveNetworkCapture(tabId)) {
+    console.log(`[opencli:nav] pre-nav detach tab=${tabId}`);
     await executor.detach(tabId);
   }
 
@@ -1802,6 +1926,18 @@ async function handleNavigate(cmd: Command, leaseKey: string): Promise<Result> {
   });
 
   let tab = await chrome.tabs.get(tabId);
+  console.log(`[opencli:nav] settled tab=${tabId} url=${tab.url ?? 'unknown'} status=${tab.status ?? '?'} timedOut=${timedOut}`);
+
+  // Amazon /dp fires a second navigation after the first `complete`. Waiting here
+  // (tabs API only — no debugger) lets that hop finish so the settle exec is less
+  // likely to die mid-Runtime.evaluate, and so content-bridge is injected.
+  if (shouldUseAggressiveAttach(leaseKey) && !timedOut) {
+    console.log(`[opencli:nav] post-complete quiet wait tab=${tabId}`);
+    await executor.waitForTabQuiet(tabId, 800, 8_000);
+    await executor.stripForeignEmbedsViaContent(tabId);
+    tab = await chrome.tabs.get(tabId);
+    console.log(`[opencli:nav] post-quiet tab=${tabId} url=${tab.url ?? 'unknown'} status=${tab.status ?? '?'}`);
+  }
 
   // Post-navigation drift detection: if the tab moved to another window
   // during navigation (e.g. a tab-management extension regrouped it),
@@ -2028,7 +2164,7 @@ async function handleCdp(cmd: Command, leaseKey: string): Promise<Result> {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const aggressive = getSurfaceFromKey(leaseKey) === 'browser';
+    const aggressive = shouldUseAggressiveAttach(leaseKey);
     await executor.ensureAttached(tabId, aggressive);
     const params = cmd.cdpParams ?? {};
     const routeFrameId = typeof params.frameId === 'string' && params.sessionId === 'target'
@@ -2309,6 +2445,7 @@ export const __test__ = {
   getCommandSurface,
   getIdleTimeout,
   getLeaseKey,
+  shouldUseAggressiveAttach,
   sessionOverrides,
   reconcileTargetLeaseRegistry,
   ensureOwnedContainerGroup,

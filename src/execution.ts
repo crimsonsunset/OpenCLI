@@ -278,11 +278,17 @@ export async function executeCommand(
       // session so a concurrent retry fails fast instead of driving the same
       // Chrome tab. The runId flows to the daemon on every command (acquire +
       // heartbeat); we release it explicitly when the command settles. Read and
-      // ephemeral commands are never leased.
-      const leaseRun = siteSession === 'persistent' && cmd.access === 'write'
+      // ephemeral commands are never leased — but every browser run still sets
+      // access on the run context so mid-command detach can be retried for reads.
+      const access = cmd.access === 'write' ? 'write' : 'read';
+      const leaseRun = siteSession === 'persistent' && access === 'write'
         ? { runId: generateRunId(), session }
         : null;
-      if (leaseRun) setDaemonRunContext({ runId: leaseRun.runId, command: fullName(cmd), access: 'write' });
+      setDaemonRunContext({
+        ...(leaseRun ? { runId: leaseRun.runId } : {}),
+        command: fullName(cmd),
+        access,
+      });
       let browserRunError: unknown;
       // `as` casts defeat literal narrowing: both are assigned only inside the
       // browserSession callback, which TS's flow analysis does not see from the
@@ -463,6 +469,8 @@ export async function executeCommand(
               await releaseSiteSessionLease({ runId: leaseRun.runId, session: leaseRun.session, surface: 'adapter' });
             }
           }
+        } else {
+          setDaemonRunContext(null);
         }
       }
     } else {

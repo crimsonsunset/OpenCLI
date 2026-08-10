@@ -1,8 +1,25 @@
 import { describe, expect, it } from 'vitest';
 
+import { BrowserCommandError } from './daemon-client.js';
 import { classifyBrowserError, isTransientBrowserError } from './errors.js';
 
 describe('classifyBrowserError', () => {
+  it('retries detached_mid_command for reads but not writes', () => {
+    const err = new BrowserCommandError('Detached while handling command.', 'detached_mid_command');
+    const readAdvice = classifyBrowserError(err, { access: 'read' });
+    expect(readAdvice.kind).toBe('extension-transient');
+    expect(readAdvice.retryable).toBe(true);
+    expect(readAdvice.delayMs).toBe(1500);
+
+    const writeAdvice = classifyBrowserError(err, { access: 'write' });
+    expect(writeAdvice.kind).toBe('non-retryable');
+    expect(writeAdvice.retryable).toBe(false);
+
+    const bareAdvice = classifyBrowserError(err);
+    expect(bareAdvice.kind).toBe('non-retryable');
+    expect(bareAdvice.retryable).toBe(false);
+  });
+
   it('classifies extension transient errors with 1500ms delay', () => {
     for (const msg of [
       'Extension disconnected',

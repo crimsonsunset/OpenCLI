@@ -7,6 +7,8 @@
  */
 
 const attached = new Set<number>();
+/** Tabs that survived target_closed / attach-poison and must not be reused. */
+const poisonedTabs = new Set<number>();
 
 const tabFrameContexts = new Map<number, Map<string, number>>();
 const frameTargets = new Map<string, string>();
@@ -109,10 +111,134 @@ function isDebuggableUrl(url?: string): boolean {
   return url.startsWith('http://') || url.startsWith('https://') || url === 'about:blank' || url.startsWith('data:');
 }
 
+/**
+ * Snapshot debugger targets for attach diagnostics. Foreign chrome-extension://
+ * frames on an otherwise-https tab are a known Chrome attach poison
+ * (OpenCLI #661/#662). Logged only — does not mutate the page.
+ */
+async function describeAttachTargets(tabId: number): Promise<string> {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const targets = await chrome.debugger.getTargets();
+    // Only targets bound to this tabId — global extension service workers are noise.
+    const onTab = targets.filter((t) => t.tabId === tabId);
+    const foreignExtOnTab = onTab.filter((t) => (
+      typeof t.url === 'string'
+      && t.url.startsWith('chrome-extension://')
+      && !t.url.startsWith(`chrome-extension://${chrome.runtime.id}/`)
+    ));
+    const pageAttachedElsewhere = onTab.some((t) => t.type === 'page' && t.attached && !attached.has(tabId));
+    const summary = {
+      tabId,
+      tabUrl: tab.url ?? null,
+      tabStatus: tab.status ?? null,
+      windowId: tab.windowId,
+      attachedCache: attached.has(tabId),
+      poisoned: poisonedTabs.has(tabId),
+      pageAttachedElsewhere,
+      onTabCount: onTab.length,
+      foreignExtOnTabCount: foreignExtOnTab.length,
+      foreignExtOnTab: foreignExtOnTab.slice(0, 20).map((t) => ({
+        type: t.type,
+        attached: t.attached,
+        url: t.url?.slice(0, 180),
+      })),
+      onTab: onTab.slice(0, 20).map((t) => ({
+        type: t.type,
+        attached: t.attached,
+        url: t.url?.slice(0, 160),
+      })),
+    };
+    return JSON.stringify(summary);
+  } catch (err) {
+    return JSON.stringify({
+      tabId,
+      describeError: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Mark a tab as unsafe to reuse for CDP after target_closed / attach poison.
+ * @param tabId - Chrome tab id
+ * @param reason - Why the tab was poisoned (for logs)
+ */
+export function markTabPoisoned(tabId: number, reason: string): void {
+  poisonedTabs.add(tabId);
+  attached.delete(tabId);
+  console.warn(`[opencli:attach] poisoned tab=${tabId} reason=${reason}`);
+}
+
+/**
+ * Wait until a tab's status stays `complete` for quietMs (Amazon /dp fires a
+ * second navigation after chrome.tabs reports complete, which kills CDP).
+ * @param tabId - Chrome tab id
+ * @param quietMs - How long status must remain complete
+ * @param maxMs - Overall deadline
+ */
+export async function waitForTabQuiet(
+  tabId: number,
+  quietMs: number = 1_200,
+  maxMs: number = 10_000,
+): Promise<void> {
+  const startedAt = Date.now();
+  let quietSince: number | null = null;
+
+  while (Date.now() - startedAt < maxMs) {
+    let status = 'unknown';
+    let url = 'unknown';
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      status = tab.status ?? 'unknown';
+      url = tab.url ?? 'unknown';
+    } catch {
+      console.warn(`[opencli:attach] waitForTabQuiet tab gone tab=${tabId}`);
+      return;
+    }
+
+    if (status === 'complete') {
+      if (quietSince === null) quietSince = Date.now();
+      if (Date.now() - quietSince >= quietMs) {
+        console.log(`[opencli:attach] tab quiet tab=${tabId} url=${url} waited=${Date.now() - startedAt}ms`);
+        return;
+      }
+    } else {
+      if (quietSince !== null) {
+        console.log(`[opencli:attach] quiet broken tab=${tabId} status=${status} url=${url}`);
+      }
+      quietSince = null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  console.warn(`[opencli:attach] waitForTabQuiet timed out tab=${tabId} after ${maxMs}ms`);
+}
+
+/**
+ * Whether a tab should be abandoned for a fresh automation tab.
+ * @param tabId - Chrome tab id
+ */
+export function isTabPoisoned(tabId: number): boolean {
+  return poisonedTabs.has(tabId);
+}
+
+/**
+ * Drop poison bookkeeping when a tab is closed/gone.
+ * @param tabId - Chrome tab id
+ */
+export function clearTabPoison(tabId: number): void {
+  poisonedTabs.delete(tabId);
+}
+
+/**
+ * Ensure chrome.debugger is attached to tabId, with optional aggressive retry.
+ * @param tabId - Chrome tab id to attach
+ * @param aggressiveRetry - Use 5×1500ms instead of 2×500ms
+ */
 export async function ensureAttached(tabId: number, aggressiveRetry: boolean = false): Promise<void> {
   // Verify the tab URL is debuggable before attempting attach
   try {
     const tab = await chrome.tabs.get(tabId);
+    console.log(`[opencli:attach] begin tab=${tabId} aggressive=${aggressiveRetry} url=${tab.url ?? 'unknown'} status=${tab.status ?? '?'} cache=${attached.has(tabId)}`);
     if (!isDebuggableUrl(tab.url)) {
       // Invalidate cache if previously attached
       attached.delete(tabId);
@@ -131,9 +257,12 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
       await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
         expression: '1', returnByValue: true,
       }, CDP_PROBE_TIMEOUT_MS);
+      console.log(`[opencli:attach] health-check ok tab=${tabId}`);
       return; // Still attached and working
-    } catch {
+    } catch (probeErr) {
       // Stale cache entry — need to re-attach
+      const probeMsg = probeErr instanceof Error ? probeErr.message : String(probeErr);
+      console.warn(`[opencli:attach] health-check failed tab=${tabId}: ${probeMsg}`);
       attached.delete(tabId);
     }
   }
@@ -158,15 +287,39 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   for (let attempt = 1; attempt <= MAX_ATTACH_RETRIES; attempt++) {
     try {
       // Force detach first to clear any stale state from other extensions
-      try { await chrome.debugger.detach({ tabId }); } catch { /* ignore */ }
+      try {
+        await chrome.debugger.detach({ tabId });
+        console.log(`[opencli:attach] pre-detach ok tab=${tabId} attempt=${attempt}`);
+      } catch (detachErr) {
+        const detachMsg = detachErr instanceof Error ? detachErr.message : String(detachErr);
+        console.log(`[opencli:attach] pre-detach noop tab=${tabId} attempt=${attempt}: ${detachMsg}`);
+      }
       await chrome.debugger.attach({ tabId }, '1.3');
+      console.log(`[opencli:attach] attach ok tab=${tabId} attempt=${attempt}/${MAX_ATTACH_RETRIES}`);
       lastError = '';
       break; // Success
     } catch (e: unknown) {
       lastError = e instanceof Error ? e.message : String(e);
+      const targets = await describeAttachTargets(tabId);
+      console.warn(`[opencli:attach] attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError} targets=${targets}`);
+      // Foreign embeds block attach; strip via content-bridge before burning retries.
+      if (lastError.includes('chrome-extension://')) {
+        await stripForeignEmbedsViaContent(tabId);
+      }
       if (attempt < MAX_ATTACH_RETRIES) {
-        console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${RETRY_DELAY_MS}ms...`);
-        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+        // Don't burn 5×1500ms on permanent ghost-attach; fail faster into content-bridge eval.
+        const delayMs = lastError.includes('chrome-extension://') && aggressiveRetry
+          ? 200
+          : RETRY_DELAY_MS;
+        const maxAttempts = lastError.includes('chrome-extension://') && aggressiveRetry
+          ? Math.min(MAX_ATTACH_RETRIES, 2)
+          : MAX_ATTACH_RETRIES;
+        if (attempt >= maxAttempts) {
+          console.warn(`[opencli:attach] giving up early for content-bridge fallback tab=${tabId}`);
+          break;
+        }
+        console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${delayMs}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
         // Re-verify tab URL before retrying (it may have changed)
         try {
           const tab = await chrome.tabs.get(tabId);
@@ -193,19 +346,29 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
       finalUrl = tab.url ?? 'undefined';
       finalWindowId = String(tab.windowId);
     } catch { /* tab gone */ }
-    console.warn(`[opencli] attach failed for tab ${tabId}: url=${finalUrl}, windowId=${finalWindowId}, error=${lastError}`);
+    const targets = await describeAttachTargets(tabId);
+    console.error(`[opencli:attach] FAILED tab=${tabId} url=${finalUrl} windowId=${finalWindowId} error=${lastError} targets=${targets}`);
+    // Aggressive callers (Amazon) still have content-bridge eval fallback — don't
+    // poison yet or resolveTab will replace the tab before that path runs.
+    if (!aggressiveRetry && (lastError.includes('chrome-extension://') || lastError.includes('Another debugger is already attached'))) {
+      markTabPoisoned(tabId, `attach-failed:${lastError.slice(0, 80)}`);
+    }
 
     const hint = lastError.includes('chrome-extension://')
       ? '. Tip: another Chrome extension may be interfering — try disabling other extensions'
       : '';
-    throw new Error(`attach failed: ${lastError}${hint}`);
+    throw new Error(`attach failed: ${lastError} (tab=${tabId} url=${finalUrl} windowId=${finalWindowId})${hint}`);
   }
   attached.add(tabId);
+  poisonedTabs.delete(tabId);
 
   try {
+    console.log(`[opencli:attach] Runtime.enable begin tab=${tabId}`);
     await sendDebuggerCommand({ tabId }, 'Runtime.enable');
-  } catch {
-    // Some pages may not need explicit enable
+    console.log(`[opencli:attach] Runtime.enable ok tab=${tabId}`);
+  } catch (enableErr) {
+    const enableMsg = enableErr instanceof Error ? enableErr.message : String(enableErr);
+    console.warn(`[opencli:attach] Runtime.enable failed tab=${tabId}: ${enableMsg}`);
   }
 
   // Restore network capture that the re-attach (detach + onDetach) tore down.
@@ -224,42 +387,220 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   }
 }
 
+/**
+ * Run one Runtime.evaluate attempt after attach.
+ * @param tabId - Chrome tab id
+ * @param expression - JS to evaluate
+ * @param aggressiveRetry - Attach retry profile
+ * @param timeoutMs - CDP deadline
+ * @param startedAt - Outer evaluate start time for log offsets
+ */
+async function evaluateOnce(
+  tabId: number,
+  expression: string,
+  aggressiveRetry: boolean,
+  timeoutMs: number,
+  startedAt: number,
+): Promise<unknown> {
+  // Attach ASAP — waiting for "quiet" before attach loses the debugger race to
+  // other extensions on Amazon /dp (pageAttachedElsewhere becomes true).
+  await ensureAttached(tabId, aggressiveRetry);
+  console.log(`[opencli:eval] Runtime.evaluate begin tab=${tabId} codeLen=${expression.length} t+${Date.now() - startedAt}ms`);
+
+  const result = await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+  }, timeoutMs) as {
+    result?: { type: string; value?: unknown; description?: string; subtype?: string };
+    exceptionDetails?: { exception?: { description?: string }; text?: string };
+  };
+
+  if (result.exceptionDetails) {
+    const errMsg = result.exceptionDetails.exception?.description
+      || result.exceptionDetails.text
+      || 'Eval error';
+    throw new Error(errMsg);
+  }
+
+  console.log(`[opencli:eval] Runtime.evaluate ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+  return result.result?.value;
+}
+
+/**
+ * Ask the content-bridge to strip foreign chrome-extension embeds (#662 style).
+ * No `scripting` permission required — content_scripts are always available after reload.
+ * @param tabId - Chrome tab id
+ */
+export async function stripForeignEmbedsViaContent(tabId: number): Promise<number> {
+  try {
+    const response = await chrome.tabs.sendMessage(tabId, { type: 'opencli:strip-frames' }) as
+      | { ok?: boolean; removed?: number }
+      | undefined;
+    const removed = response?.removed ?? 0;
+    console.log(`[opencli:attach] content strip-frames tab=${tabId} removed=${removed}`);
+    return removed;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[opencli:attach] content strip-frames unavailable tab=${tabId}: ${msg}`);
+    return 0;
+  }
+}
+
+/**
+ * Evaluate via content-bridge (isolated world) when CDP attach is poisoned.
+ * @param tabId - Chrome tab id
+ * @param expression - JS source CDP would have received
+ * @param startedAt - Outer evaluate start time for log offsets
+ */
+async function evaluateViaContentBridge(
+  tabId: number,
+  expression: string,
+  startedAt: number,
+): Promise<unknown> {
+  console.warn(`[opencli:eval] content-bridge fallback begin tab=${tabId} codeLen=${expression.length} t+${Date.now() - startedAt}ms`);
+  await waitForTabQuiet(tabId, 800, 8_000);
+  await stripForeignEmbedsViaContent(tabId);
+
+  const response = await chrome.tabs.sendMessage(tabId, {
+    type: 'opencli:eval',
+    code: expression,
+  }) as { ok?: boolean; value?: unknown; error?: string } | undefined;
+
+  if (!response?.ok) {
+    throw new Error(response?.error || 'content-bridge eval failed');
+  }
+  console.log(`[opencli:eval] content-bridge fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+  return response.value;
+}
+
+/**
+ * Evaluate via chrome.userScripts (USER_SCRIPT world). This is the MV3-legal way
+ * to run arbitrary adapter code when chrome.debugger cannot attach — isolated
+ * content-script/scripting eval is blocked by extension CSP (no unsafe-eval).
+ * @param tabId - Chrome tab id
+ * @param expression - JS source CDP would have received
+ * @param startedAt - Outer evaluate start time for log offsets
+ */
+async function evaluateViaUserScripts(
+  tabId: number,
+  expression: string,
+  startedAt: number,
+): Promise<unknown> {
+  if (!chrome.userScripts?.execute) {
+    throw new Error(
+      'userScripts.execute unavailable — enable "Allow User Scripts" on the OpenCLI extension details page, then reload',
+    );
+  }
+  console.warn(`[opencli:eval] userScripts fallback begin tab=${tabId} codeLen=${expression.length} t+${Date.now() - startedAt}ms`);
+  await waitForTabQuiet(tabId, 400, 4_000);
+  await stripForeignEmbedsViaContent(tabId);
+
+  // USER_SCRIPT world is exempt from page CSP; await promise completion values
+  // the same way Runtime.evaluate(awaitPromise=true) does.
+  const results = await chrome.userScripts.execute({
+    target: { tabId },
+    world: 'USER_SCRIPT',
+    injectImmediately: true,
+    js: [{ code: expression }],
+  });
+  const injection = results?.[0];
+  if (injection?.error) {
+    throw new Error(String(injection.error));
+  }
+  console.log(`[opencli:eval] userScripts fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+  return injection?.result;
+}
+
+/**
+ * chrome.scripting path with explicit ok/error envelope so CSP-blocked eval
+ * cannot silently return null (which crashed amazon readPageState on .href).
+ * @param tabId - Chrome tab id
+ * @param expression - JS source
+ * @param world - Execution world
+ */
+async function evaluateViaScriptingWorld(
+  tabId: number,
+  expression: string,
+  world: 'MAIN' | 'ISOLATED',
+): Promise<unknown> {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world,
+    args: [expression],
+    func: async (code: string) => {
+      try {
+        // eslint-disable-next-line no-eval
+        const value = await (0, eval)(code);
+        return { __opencli: true, ok: true as const, value };
+      } catch (err) {
+        return {
+          __opencli: true,
+          ok: false as const,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+  });
+  const wrapped = injection?.result as
+    | { __opencli?: boolean; ok?: boolean; value?: unknown; error?: string }
+    | undefined;
+  if (!wrapped || wrapped.__opencli !== true) {
+    throw new Error('scripting fallback returned no result (likely CSP-blocked eval)');
+  }
+  if (!wrapped.ok) {
+    throw new Error(wrapped.error || 'scripting fallback eval failed');
+  }
+  return wrapped.value;
+}
+
 export async function evaluate(
   tabId: number,
   expression: string,
   aggressiveRetry: boolean = false,
   timeoutMs: number = CDP_COMMAND_TIMEOUT_MS,
 ): Promise<unknown> {
-  // No retry loop here: failures carry a machine-readable errorCode (see
-  // classifyExtensionError in background.ts) and the CLI decides whether a
-  // NEW logical attempt is safe. ensureAttached still does its own local
-  // attach retries; a debugger error mid-evaluate invalidates the attach
-  // cache so the next attempt re-attaches.
+  // Aggressive profile (Amazon / browser): CDP often dies after /dp secondary nav.
+  // Prefer userScripts (arbitrary code, CSP-safe world), then scripting envelope.
+  const startedAt = Date.now();
   try {
-    await ensureAttached(tabId, aggressiveRetry);
-
-    const result = await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
-      expression,
-      returnByValue: true,
-      awaitPromise: true,
-    }, timeoutMs) as {
-      result?: { type: string; value?: unknown; description?: string; subtype?: string };
-      exceptionDetails?: { exception?: { description?: string }; text?: string };
-    };
-
-    if (result.exceptionDetails) {
-      const errMsg = result.exceptionDetails.exception?.description
-        || result.exceptionDetails.text
-        || 'Eval error';
-      throw new Error(errMsg);
-    }
-
-    return result.result?.value;
+    return await evaluateOnce(tabId, expression, aggressiveRetry, timeoutMs, startedAt);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes('Detached') || msg.includes('Debugger is not attached') || msg.includes('Target closed')) {
-      attached.delete(tabId); // Force re-attach on the next command
+    console.warn(`[opencli:eval] failed tab=${tabId} t+${Date.now() - startedAt}ms: ${msg}`);
+    const isDetach = msg.includes('Detached')
+      || msg.includes('Debugger is not attached')
+      || msg.includes('Target closed')
+      || msg.includes('attach failed');
+    if (!isDetach) throw e;
+
+    attached.delete(tabId);
+    if (!aggressiveRetry) {
+      markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
+      throw e;
     }
+
+    try {
+      return await evaluateViaUserScripts(tabId, expression, startedAt);
+    } catch (userScriptErr) {
+      const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
+      console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+    }
+
+    if (chrome.scripting?.executeScript) {
+      try {
+        console.warn(`[opencli:eval] scripting fallback begin tab=${tabId}`);
+        await waitForTabQuiet(tabId, 400, 4_000);
+        const value = await evaluateViaScriptingWorld(tabId, expression, 'ISOLATED');
+        console.log(`[opencli:eval] scripting fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+        return value;
+      } catch (scriptErr) {
+        const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
+        console.warn(`[opencli:eval] scripting fallback failed tab=${tabId}: ${scriptMsg}`);
+      }
+    }
+
+    markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
     throw e;
   }
 }
@@ -815,13 +1156,24 @@ export function registerListeners(): void {
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     clearFrameTargetsForTab(tabId);
+    clearTabPoison(tabId);
   });
-  chrome.debugger.onDetach.addListener((source) => {
+  chrome.debugger.onDetach.addListener((source, reason) => {
+    console.warn(`[opencli:attach] onDetach tabId=${source.tabId ?? 'n/a'} targetId=${source.targetId ?? 'n/a'} reason=${reason ?? 'unknown'}`);
     if (source.tabId) {
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
+      // canceled_by_user: DevTools stole the debugger — tab is unsafe to reuse.
+      // target_closed alone is NOT poison: Amazon /dp fires a secondary navigation
+      // after a successful settle eval; mid-command detach still poisons from evaluate().
+      if (reason === 'canceled_by_user') {
+        markTabPoisoned(source.tabId, `onDetach:${reason}`);
+      }
+      void describeAttachTargets(source.tabId).then((targets) => {
+        console.warn(`[opencli:attach] post-detach targets tab=${source.tabId} ${targets}`);
+      });
       return;
     }
     if (source.targetId) clearFrameTarget(source.targetId);

@@ -118,12 +118,8 @@ export class Page extends CDPBasePage {
     if (options?.waitUntil !== 'none') {
       const maxMs = options?.settleMs ?? 1000;
       const combinedCode = `${generateStealthJs()};\n${waitForDomStableJs(maxMs, Math.min(500, maxMs))}`;
-      const combinedOpts = {
-        code: combinedCode,
-        ...this._cmdOpts(),
-      };
       try {
-        await sendCommand('exec', combinedOpts);
+        await this._execRememberPage(combinedCode);
       } catch (err) {
         const advice = classifyBrowserError(err);
         // Only settle-retry on target navigation (SPA client-side redirects).
@@ -132,7 +128,7 @@ export class Page extends CDPBasePage {
         if (advice.kind !== 'target-navigation') throw err;
         try {
           await new Promise((r) => setTimeout(r, advice.delayMs));
-          await sendCommand('exec', combinedOpts);
+          await this._execRememberPage(combinedCode);
         } catch (retryErr) {
           if (classifyBrowserError(retryErr).kind !== 'target-navigation') throw retryErr;
         }
@@ -140,10 +136,7 @@ export class Page extends CDPBasePage {
     } else {
       // Even with waitUntil='none', still inject stealth (best-effort)
       try {
-        await sendCommand('exec', {
-          code: generateStealthJs(),
-          ...this._cmdOpts(),
-        });
+        await this._execRememberPage(generateStealthJs());
       } catch {
         // Non-fatal: stealth is best-effort
       }
@@ -170,17 +163,31 @@ export class Page extends CDPBasePage {
     );
   }
 
+  /**
+   * Run exec and adopt any updated page identity (e.g. after CDP poison tab replace).
+   * @param code - JS payload for the extension Runtime.evaluate / scripting path
+   * @param extra - Extra daemon command fields (frameIndex, etc.)
+   */
+  private async _execRememberPage(
+    code: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<unknown> {
+    const result = await sendCommandFull('exec', { code, ...this._cmdOpts(), ...extra });
+    if (result.page) this._page = result.page;
+    return result.data;
+  }
+
   async evaluate<T = unknown>(js: string): Promise<T>;
   async evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
   async evaluate(input: string | BrowserEvaluateFunction<unknown[], unknown>, ...args: unknown[]): Promise<unknown> {
     const code = buildEvaluateExpression(input, args);
     try {
-      return await sendCommand('exec', { code, ...this._cmdOpts() });
+      return await this._execRememberPage(code);
     } catch (err) {
       const advice = classifyBrowserError(err);
       if (advice.kind !== 'target-navigation') throw err;
       await new Promise((resolve) => setTimeout(resolve, advice.delayMs));
-      return sendCommand('exec', { code, ...this._cmdOpts() });
+      return this._execRememberPage(code);
     }
   }
 
