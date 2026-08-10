@@ -1359,6 +1359,47 @@
   },
   {
     "site": "amazon",
+    "name": "ask",
+    "description": "Ask the product-page Looking for specific info? / Ask Alexa widget (Nile): suggested questions and streamed answers from reviews + Q&A",
+    "access": "read",
+    "domain": "amazon.com",
+    "strategy": "cookie",
+    "browser": true,
+    "args": [
+      {
+        "name": "input",
+        "type": "str",
+        "required": true,
+        "positional": true,
+        "help": "ASIN or product URL, for example B0G1SKBNJM"
+      },
+      {
+        "name": "question",
+        "type": "str",
+        "required": false,
+        "positional": true,
+        "help": "Question to submit (omit to only list suggested questions)"
+      },
+      {
+        "name": "timeoutMs",
+        "type": "int",
+        "default": 25000,
+        "required": false,
+        "help": "Max wait for streamed answer (default 25000)"
+      }
+    ],
+    "columns": [
+      "asin",
+      "question",
+      "answer"
+    ],
+    "type": "js",
+    "modulePath": "amazon/ask.js",
+    "sourceFile": "amazon/ask.js",
+    "navigateBefore": false
+  },
+  {
+    "site": "amazon",
     "name": "bestsellers",
     "description": "Amazon Best Sellers pages for category candidate discovery",
     "access": "read",
