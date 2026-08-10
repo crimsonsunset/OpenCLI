@@ -1096,8 +1096,28 @@ function initialTabIsAvailable(tabId: number | undefined): tabId is number {
  * Amazon /dp routinely fires target_closed mid-eval; Chrome then leaves the
  * page target `attached:true` while refusing our detach/attach with a misleading
  * chrome-extension:// error. Retrying the same tab never recovers — swap it.
+ * Serialized via withLeaseMutation so concurrent reads cannot double-replace.
+ * @param leaseKey - Session lease key
+ * @param poisonedTabId - Tab id that must be abandoned
+ * @param preferredUrl - Optional URL to open on the replacement tab
  */
 async function replacePoisonedOwnedTab(
+  leaseKey: string,
+  poisonedTabId: number,
+  preferredUrl?: string,
+): Promise<ResolvedTab> {
+  return withLeaseMutation(() => replacePoisonedOwnedTabUnlocked(leaseKey, poisonedTabId, preferredUrl));
+}
+
+/**
+ * Unlocked body of poisoned-tab replacement (caller must hold withLeaseMutation).
+ * Re-validates lease/poison state after queue entry so a prior waiter that
+ * already replaced wins without spawning a second tab.
+ * @param leaseKey - Session lease key
+ * @param poisonedTabId - Tab id that must be abandoned
+ * @param preferredUrl - Optional URL to open on the replacement tab
+ */
+async function replacePoisonedOwnedTabUnlocked(
   leaseKey: string,
   poisonedTabId: number,
   preferredUrl?: string,
@@ -1105,6 +1125,30 @@ async function replacePoisonedOwnedTab(
   const session = automationSessions.get(leaseKey);
   if (!session?.owned) {
     throw new Error(`Cannot replace poisoned tab ${poisonedTabId}: lease is not owned`);
+  }
+
+  // Another waiter may have already swapped this lease's preferred tab.
+  if (
+    session.preferredTabId !== null
+    && session.preferredTabId !== poisonedTabId
+    && !executor.isTabPoisoned(session.preferredTabId)
+  ) {
+    try {
+      const existing = await chrome.tabs.get(session.preferredTabId);
+      if (isDebuggableUrl(existing.url)) {
+        console.log(`[opencli:attach] poison replace skipped; lease already moved to tab=${session.preferredTabId}`);
+        return { tabId: session.preferredTabId, tab: existing };
+      }
+    } catch { /* preferred gone — continue replace */ }
+  }
+
+  if (!executor.isTabPoisoned(poisonedTabId) && session.preferredTabId === poisonedTabId) {
+    try {
+      const stillGood = await chrome.tabs.get(poisonedTabId);
+      if (isDebuggableUrl(stillGood.url)) {
+        return { tabId: poisonedTabId, tab: stillGood };
+      }
+    } catch { /* continue replace */ }
   }
 
   let targetUrl = preferredUrl;

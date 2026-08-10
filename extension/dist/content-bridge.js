@@ -14,18 +14,10 @@ function stripForeignExtensionEmbeds(root = document) {
   }
   return removed;
 }
-function watchForeignEmbeds() {
-  stripForeignExtensionEmbeds();
-  const obs = new MutationObserver(() => {
-    stripForeignExtensionEmbeds();
-  });
-  obs.observe(document.documentElement, { childList: true, subtree: true });
-}
 async function evalInIsolated(code) {
   const value = (0, eval)(code);
   return await value;
 }
-watchForeignEmbeds();
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message !== "object") return false;
   if (message.type === "opencli:strip-frames") {
