@@ -296,6 +296,43 @@ async function evaluateViaScriptingWorld(tabId, expression, world) {
   }
   return wrapped.value;
 }
+function isPreEvalAttachFailure(message) {
+  return message.includes("attach failed") || message.includes("Debugger is not attached");
+}
+async function evaluateViaFallbacks(tabId, expression, startedAt) {
+  const hasScripting = typeof chrome.scripting?.executeScript === "function";
+  if (hasScripting) {
+    try {
+      console.warn(`[opencli:eval] scripting MAIN fallback begin tab=${tabId}`);
+      await waitForTabQuiet(tabId, 400, 4e3);
+      const value = await evaluateViaScriptingWorld(tabId, expression, "MAIN");
+      console.log(`[opencli:eval] scripting MAIN fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+      return value;
+    } catch (scriptErr) {
+      const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
+      console.warn(`[opencli:eval] scripting MAIN fallback failed tab=${tabId}: ${scriptMsg}`);
+    }
+  }
+  try {
+    return await evaluateViaUserScripts(tabId, expression, startedAt);
+  } catch (userScriptErr) {
+    const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
+    console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+  }
+  if (hasScripting) {
+    try {
+      console.warn(`[opencli:eval] scripting ISOLATED fallback begin tab=${tabId}`);
+      await waitForTabQuiet(tabId, 400, 4e3);
+      const value = await evaluateViaScriptingWorld(tabId, expression, "ISOLATED");
+      console.log(`[opencli:eval] scripting ISOLATED fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+      return value;
+    } catch (scriptErr) {
+      const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
+      console.warn(`[opencli:eval] scripting ISOLATED fallback failed tab=${tabId}: ${scriptMsg}`);
+    }
+  }
+  throw new Error("all non-CDP eval fallbacks failed");
+}
 async function evaluate(tabId, expression, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
   const startedAt = Date.now();
   try {
@@ -306,30 +343,18 @@ async function evaluate(tabId, expression, aggressiveRetry = false, timeoutMs = 
     const isDetach = msg.includes("Detached") || msg.includes("Debugger is not attached") || msg.includes("Target closed") || msg.includes("attach failed");
     if (!isDetach) throw e;
     attached.delete(tabId);
-    if (!aggressiveRetry) {
+    if (!aggressiveRetry || !isPreEvalAttachFailure(msg)) {
       markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
       throw e;
     }
     try {
-      return await evaluateViaUserScripts(tabId, expression, startedAt);
-    } catch (userScriptErr) {
-      const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
-      console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+      return await evaluateViaFallbacks(tabId, expression, startedAt);
+    } catch (fallbackErr) {
+      const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      console.warn(`[opencli:eval] fallbacks exhausted tab=${tabId}: ${fallbackMsg}`);
+      markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
+      throw e;
     }
-    if (chrome.scripting?.executeScript) {
-      try {
-        console.warn(`[opencli:eval] scripting fallback begin tab=${tabId}`);
-        await waitForTabQuiet(tabId, 400, 4e3);
-        const value = await evaluateViaScriptingWorld(tabId, expression, "ISOLATED");
-        console.log(`[opencli:eval] scripting fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
-        return value;
-      } catch (scriptErr) {
-        const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
-        console.warn(`[opencli:eval] scripting fallback failed tab=${tabId}: ${scriptMsg}`);
-      }
-    }
-    markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
-    throw e;
   }
 }
 const evaluateAsync = evaluate;
@@ -1711,9 +1736,31 @@ function initialTabIsAvailable(tabId) {
   return true;
 }
 async function replacePoisonedOwnedTab(leaseKey, poisonedTabId, preferredUrl) {
+  return withLeaseMutation(() => replacePoisonedOwnedTabUnlocked(leaseKey, poisonedTabId, preferredUrl));
+}
+async function replacePoisonedOwnedTabUnlocked(leaseKey, poisonedTabId, preferredUrl) {
   const session = automationSessions.get(leaseKey);
   if (!session?.owned) {
     throw new Error(`Cannot replace poisoned tab ${poisonedTabId}: lease is not owned`);
+  }
+  if (session.preferredTabId !== null && session.preferredTabId !== poisonedTabId && !isTabPoisoned(session.preferredTabId)) {
+    try {
+      const existing = await chrome.tabs.get(session.preferredTabId);
+      if (isDebuggableUrl(existing.url)) {
+        console.log(`[opencli:attach] poison replace skipped; lease already moved to tab=${session.preferredTabId}`);
+        return { tabId: session.preferredTabId, tab: existing };
+      }
+    } catch {
+    }
+  }
+  if (!isTabPoisoned(poisonedTabId) && session.preferredTabId === poisonedTabId) {
+    try {
+      const stillGood = await chrome.tabs.get(poisonedTabId);
+      if (isDebuggableUrl(stillGood.url)) {
+        return { tabId: poisonedTabId, tab: stillGood };
+      }
+    } catch {
+    }
   }
   let targetUrl = preferredUrl;
   if (!targetUrl || !isSafeNavigationUrl(targetUrl)) {

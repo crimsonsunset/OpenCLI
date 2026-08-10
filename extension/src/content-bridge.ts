@@ -3,7 +3,7 @@
  *
  * Runs without the `scripting` permission (which Extensions Reloader does not
  * grant on manifest bumps). Strips foreign chrome-extension embeds that block
- * chrome.debugger.attach, and evaluates settle/read payloads when CDP is poisoned.
+ * chrome.debugger.attach on request from the service worker.
  */
 
 const OWN_PREFIX = chrome.runtime.getURL('');
@@ -32,17 +32,6 @@ function stripForeignExtensionEmbeds(root: ParentNode = document): number {
 }
 
 /**
- * Keep stripping embeds as shopping/password extensions re-inject them.
- */
-function watchForeignEmbeds(): void {
-  stripForeignExtensionEmbeds();
-  const obs = new MutationObserver(() => {
-    stripForeignExtensionEmbeds();
-  });
-  obs.observe(document.documentElement, { childList: true, subtree: true });
-}
-
-/**
  * Evaluate page JS with Runtime.evaluate-like completion semantics.
  * @param code - Source string (may be multi-statement; last value awaited)
  */
@@ -51,8 +40,6 @@ async function evalInIsolated(code: string): Promise<unknown> {
   const value = (0, eval)(code);
   return await value;
 }
-
-watchForeignEmbeds();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message !== 'object') return false;

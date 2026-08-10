@@ -554,14 +554,76 @@ async function evaluateViaScriptingWorld(
   return wrapped.value;
 }
 
+/**
+ * Whether an eval failure is safe to replay via non-CDP fallbacks.
+ * Only pre-eval attach failures are replay-safe — mid-command Detached /
+ * Target closed means the expression may already have run (write hazard).
+ * @param message - Error message from evaluateOnce / ensureAttached
+ */
+function isPreEvalAttachFailure(message: string): boolean {
+  return message.includes('attach failed')
+    || message.includes('Debugger is not attached');
+}
+
+/**
+ * Evaluate via scripting MAIN → userScripts → scripting ISOLATED.
+ * MAIN matches Runtime.evaluate's page world when CSP allows; USER_SCRIPT is
+ * the MV3-legal arbitrary-code path for Amazon /dp; ISOLATED is last resort.
+ * @param tabId - Chrome tab id
+ * @param expression - JS source CDP would have received
+ * @param startedAt - Outer evaluate start time for log offsets
+ */
+async function evaluateViaFallbacks(
+  tabId: number,
+  expression: string,
+  startedAt: number,
+): Promise<unknown> {
+  const hasScripting = typeof chrome.scripting?.executeScript === 'function';
+  if (hasScripting) {
+    try {
+      console.warn(`[opencli:eval] scripting MAIN fallback begin tab=${tabId}`);
+      await waitForTabQuiet(tabId, 400, 4_000);
+      const value = await evaluateViaScriptingWorld(tabId, expression, 'MAIN');
+      console.log(`[opencli:eval] scripting MAIN fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+      return value;
+    } catch (scriptErr) {
+      const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
+      console.warn(`[opencli:eval] scripting MAIN fallback failed tab=${tabId}: ${scriptMsg}`);
+    }
+  }
+
+  try {
+    return await evaluateViaUserScripts(tabId, expression, startedAt);
+  } catch (userScriptErr) {
+    const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
+    console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+  }
+
+  if (hasScripting) {
+    try {
+      console.warn(`[opencli:eval] scripting ISOLATED fallback begin tab=${tabId}`);
+      await waitForTabQuiet(tabId, 400, 4_000);
+      const value = await evaluateViaScriptingWorld(tabId, expression, 'ISOLATED');
+      console.log(`[opencli:eval] scripting ISOLATED fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+      return value;
+    } catch (scriptErr) {
+      const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
+      console.warn(`[opencli:eval] scripting ISOLATED fallback failed tab=${tabId}: ${scriptMsg}`);
+    }
+  }
+
+  throw new Error('all non-CDP eval fallbacks failed');
+}
+
 export async function evaluate(
   tabId: number,
   expression: string,
   aggressiveRetry: boolean = false,
   timeoutMs: number = CDP_COMMAND_TIMEOUT_MS,
 ): Promise<unknown> {
-  // Aggressive profile (Amazon / browser): CDP often dies after /dp secondary nav.
-  // Prefer userScripts (arbitrary code, CSP-safe world), then scripting envelope.
+  // Aggressive profile (Amazon / browser): CDP often cannot attach after /dp
+  // secondary nav. Replay only for pre-eval attach failures — never for
+  // mid-command Detached/Target closed (expression may already have applied).
   const startedAt = Date.now();
   try {
     return await evaluateOnce(tabId, expression, aggressiveRetry, timeoutMs, startedAt);
@@ -575,33 +637,19 @@ export async function evaluate(
     if (!isDetach) throw e;
 
     attached.delete(tabId);
-    if (!aggressiveRetry) {
+    if (!aggressiveRetry || !isPreEvalAttachFailure(msg)) {
       markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
       throw e;
     }
 
     try {
-      return await evaluateViaUserScripts(tabId, expression, startedAt);
-    } catch (userScriptErr) {
-      const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
-      console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+      return await evaluateViaFallbacks(tabId, expression, startedAt);
+    } catch (fallbackErr) {
+      const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      console.warn(`[opencli:eval] fallbacks exhausted tab=${tabId}: ${fallbackMsg}`);
+      markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
+      throw e;
     }
-
-    if (chrome.scripting?.executeScript) {
-      try {
-        console.warn(`[opencli:eval] scripting fallback begin tab=${tabId}`);
-        await waitForTabQuiet(tabId, 400, 4_000);
-        const value = await evaluateViaScriptingWorld(tabId, expression, 'ISOLATED');
-        console.log(`[opencli:eval] scripting fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
-        return value;
-      } catch (scriptErr) {
-        const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
-        console.warn(`[opencli:eval] scripting fallback failed tab=${tabId}: ${scriptMsg}`);
-      }
-    }
-
-    markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
-    throw e;
   }
 }
 
