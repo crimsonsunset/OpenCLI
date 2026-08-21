@@ -1544,8 +1544,22 @@ function getUrlOrigin(url: string | undefined): string | null {
   }
 }
 
-function enumerateCrossOriginFrames(tree: any): Array<{ index: number; frameId: string; url: string; name: string }> {
+/**
+ * Page.getFrameTree() only sees frames in-process with the tab's main frame —
+ * true out-of-process iframes (any cross-site embed under Site Isolation)
+ * never show up in its childFrames at all. `knownTargets` comes from
+ * executor.discoverFrameTargets(), the Target.attachedToTarget-based path
+ * that actually reaches OOPIFs, and both fills in real URLs for tree slots
+ * that only got as far as "about:blank" and appends OOPIFs the tree walk
+ * missed outright.
+ */
+function enumerateCrossOriginFrames(
+  tree: any,
+  knownTargets: Array<{ frameId: string; url: string }> = [],
+): Array<{ index: number; frameId: string; url: string; name: string }> {
   const frames: Array<{ index: number; frameId: string; url: string; name: string }> = [];
+  const targetUrlByFrameId = new Map(knownTargets.map((t) => [t.frameId, t.url]));
+  const seenFrameIds = new Set<string>();
 
   function collect(node: any, accessibleOrigin: string | null) {
     for (const child of (node.childFrames || [])) {
@@ -1561,10 +1575,11 @@ function enumerateCrossOriginFrames(tree: any): Array<{ index: number; frameId: 
         continue;
       }
 
+      seenFrameIds.add(frame.id);
       frames.push({
         index: frames.length,
         frameId: frame.id,
-        url: frameUrl,
+        url: targetUrlByFrameId.get(frame.id) || frameUrl,
         name: frame.name || '',
       });
     }
@@ -1573,6 +1588,12 @@ function enumerateCrossOriginFrames(tree: any): Array<{ index: number; frameId: 
   const rootFrame = tree?.frameTree?.frame;
   const rootUrl = rootFrame?.url || rootFrame?.unreachableUrl || '';
   collect(tree.frameTree, getUrlOrigin(rootUrl));
+
+  for (const target of knownTargets) {
+    if (seenFrameIds.has(target.frameId)) continue;
+    frames.push({ index: frames.length, frameId: target.frameId, url: target.url, name: '' });
+  }
+
   return frames;
 }
 
@@ -1837,7 +1858,8 @@ async function handleExec(cmd: Command, leaseKey: string): Promise<Result> {
     console.log(`[opencli:exec] start lease=${leaseKey} tab=${tabId} aggressive=${aggressive} frameIndex=${cmd.frameIndex ?? 'main'} codeLen=${cmd.code.length}`);
     if (cmd.frameIndex != null) {
       const tree = await executor.getFrameTree(tabId);
-      const frames = enumerateCrossOriginFrames(tree);
+      const knownTargets = await executor.discoverFrameTargets(tabId);
+      const frames = enumerateCrossOriginFrames(tree, knownTargets);
       if (cmd.frameIndex < 0 || cmd.frameIndex >= frames.length) {
         return { id: cmd.id, ok: false, error: `Frame index ${cmd.frameIndex} out of range (${frames.length} cross-origin frames available)` };
       }
@@ -1856,7 +1878,8 @@ async function handleFrames(cmd: Command, leaseKey: string): Promise<Result> {
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     const tree = await executor.getFrameTree(tabId);
-    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree) };
+    const knownTargets = await executor.discoverFrameTargets(tabId);
+    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree, knownTargets) };
   } catch (err) {
     return errorResult(cmd.id, err);
   }

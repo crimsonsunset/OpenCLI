@@ -6,9 +6,9 @@ const DAEMON_PING_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}/ping`;
 const attached = /* @__PURE__ */ new Set();
 const poisonedTabs = /* @__PURE__ */ new Set();
 const tabFrameContexts = /* @__PURE__ */ new Map();
-const frameTargets = /* @__PURE__ */ new Map();
-const frameTargetKeys = /* @__PURE__ */ new Map();
-let frameTargetCleanupRegistered = false;
+const frameSessions = /* @__PURE__ */ new Map();
+const frameTargetUrls = /* @__PURE__ */ new Map();
+const autoAttachRequested = /* @__PURE__ */ new Set();
 const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
 const networkCaptures = /* @__PURE__ */ new Map();
@@ -548,66 +548,60 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4) {
     });
   });
 }
-function frameTargetKey(tabId, frameId) {
-  return `${tabId}:${frameId}`;
-}
-function registerFrameTargetCleanup() {
-  if (frameTargetCleanupRegistered) return;
-  frameTargetCleanupRegistered = true;
-  chrome.debugger.onEvent.addListener((_source, method, params) => {
-    if (method === "Target.detachedFromTarget") {
-      const targetId = String(params?.targetId || "");
-      clearFrameTarget(targetId);
-    }
-  });
-}
-function clearFrameTarget(targetId) {
-  if (!targetId) return;
-  const key = frameTargetKeys.get(targetId);
-  if (key) frameTargets.delete(key);
-  frameTargetKeys.delete(targetId);
-}
-async function ensureFrameTarget(tabId, frameId, aggressiveRetry = false, targetUrl) {
-  registerFrameTargetCleanup();
-  await ensureAttached(tabId, aggressiveRetry);
-  const key = frameTargetKey(tabId, frameId);
-  const existing = frameTargets.get(key);
-  if (existing) return existing;
-  await sendDebuggerCommand({ tabId }, "Target.setDiscoverTargets", { discover: true }).catch(() => {
-  });
-  await sendDebuggerCommand({ tabId }, "Target.setAutoAttach", {
-    autoAttach: true,
-    waitForDebuggerOnStart: false,
-    flatten: true,
-    filter: [{ type: "iframe", exclude: false }]
-  }).catch(() => {
-  });
-  const targetId = await resolveFrameTargetId(tabId, frameId, targetUrl);
+async function ensureAutoAttach(tabId) {
+  if (autoAttachRequested.has(tabId)) return;
+  autoAttachRequested.add(tabId);
   try {
-    await chrome.debugger.attach({ targetId }, "1.3");
+    await sendDebuggerCommand({ tabId }, "Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+      filter: [{ type: "iframe", exclude: false }]
+    });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (!message.includes("Another debugger is already attached")) throw err;
+    autoAttachRequested.delete(tabId);
+    throw err;
   }
-  frameTargets.set(key, targetId);
-  frameTargetKeys.set(targetId, key);
-  return targetId;
 }
-async function resolveFrameTargetId(tabId, frameId, targetUrl) {
-  const result = await sendDebuggerCommand({ tabId }, "Target.getTargets").catch(() => null);
-  const targets = result?.targetInfos ?? [];
-  const frameTarget = targets.find((candidate) => {
-    const candidateId = candidate.targetId || candidate.id;
-    return candidate.type === "iframe" && (candidateId === frameId || !!targetUrl && candidate.url === targetUrl);
-  });
-  const targetId = frameTarget?.targetId || frameTarget?.id;
-  if (targetId) return targetId;
-  const candidates = targets.filter((target) => target.type === "iframe").map((target) => `${target.targetId || target.id || "?"} ${target.url || ""}`).join("; ");
-  throw new Error(`No iframe target found for frame ${frameId}${targetUrl ? ` (${targetUrl})` : ""}. Candidates: ${candidates || "none"}`);
+function getKnownFrameTargets(tabId) {
+  const sessions = frameSessions.get(tabId);
+  if (!sessions) return [];
+  return [...sessions.keys()].map((frameId) => ({ frameId, url: frameTargetUrls.get(frameId) ?? "" }));
 }
-async function sendCommandInFrameTarget(tabId, frameId, method, params = {}, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS, targetUrl) {
-  const targetId = await ensureFrameTarget(tabId, frameId, aggressiveRetry, targetUrl);
-  const target = { targetId };
+async function discoverFrameTargets(tabId, timeoutMs = 1500) {
+  await ensureAttached(tabId);
+  await ensureAutoAttach(tabId);
+  const deadline = Date.now() + timeoutMs;
+  let lastCount = -1;
+  let stableChecks = 0;
+  while (Date.now() < deadline) {
+    const count = frameSessions.get(tabId)?.size ?? 0;
+    if (count > 0 && count === lastCount) {
+      stableChecks += 1;
+      if (stableChecks >= 2) break;
+    } else {
+      stableChecks = 0;
+    }
+    lastCount = count;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return getKnownFrameTargets(tabId);
+}
+async function resolveFrameSessionId(tabId, frameId, timeoutMs) {
+  await ensureAutoAttach(tabId);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const sessionId = frameSessions.get(tabId)?.get(frameId);
+    if (sessionId) return sessionId;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const known = getKnownFrameTargets(tabId).map((t) => `${t.frameId} ${t.url}`).join("; ");
+  throw new Error(`No cross-origin frame target found for frame ${frameId}. Candidates: ${known || "none"}`);
+}
+async function sendCommandInFrameTarget(tabId, frameId, method, params = {}, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS, _targetUrl) {
+  await ensureAttached(tabId, aggressiveRetry);
+  const sessionId = await resolveFrameSessionId(tabId, frameId, timeoutMs);
+  const target = { tabId, sessionId };
   return sendDebuggerCommand(target, method, params, timeoutMs);
 }
 async function insertText(tabId, text) {
@@ -615,10 +609,46 @@ async function insertText(tabId, text) {
   await sendDebuggerCommand({ tabId }, "Input.insertText", { text });
 }
 function registerFrameTracking() {
-  registerFrameTargetCleanup();
   chrome.debugger.onEvent.addListener((source, method, params) => {
     const tabId = source.tabId;
     if (!tabId) return;
+    if (method === "Target.attachedToTarget") {
+      const info = params?.targetInfo;
+      const sessionId = params?.sessionId;
+      if (info?.type === "iframe" && info.targetId && sessionId) {
+        if (!frameSessions.has(tabId)) frameSessions.set(tabId, /* @__PURE__ */ new Map());
+        frameSessions.get(tabId).set(info.targetId, sessionId);
+        frameTargetUrls.set(info.targetId, info.url ?? "");
+        sendDebuggerCommand({ tabId, sessionId }, "Target.setAutoAttach", {
+          autoAttach: true,
+          waitForDebuggerOnStart: false,
+          flatten: true,
+          filter: [{ type: "iframe", exclude: false }]
+        }).catch(() => {
+        });
+      }
+      return;
+    }
+    if (method === "Target.targetInfoChanged") {
+      const info = params?.targetInfo;
+      if (info?.type === "iframe" && info.targetId) frameTargetUrls.set(info.targetId, info.url ?? "");
+      return;
+    }
+    if (method === "Target.detachedFromTarget") {
+      const sessionId = params?.sessionId;
+      const sessions = frameSessions.get(tabId);
+      if (sessions && sessionId) {
+        for (const [frameId, sid] of sessions) {
+          if (sid === sessionId) {
+            sessions.delete(frameId);
+            frameTargetUrls.delete(frameId);
+            break;
+          }
+        }
+      }
+      return;
+    }
+    if (source.sessionId) return;
     if (method === "Runtime.executionContextCreated") {
       const context = params.context;
       if (!context?.auxData?.frameId || context.auxData.isDefault !== true) return;
@@ -748,13 +778,10 @@ function hasActiveNetworkCapture(tabId) {
   return networkCaptures.has(tabId);
 }
 function clearFrameTargetsForTab(tabId) {
-  for (const [key, targetId] of [...frameTargets.entries()]) {
-    if (!key.startsWith(`${tabId}:`)) continue;
-    frameTargets.delete(key);
-    frameTargetKeys.delete(targetId);
-    chrome.debugger.detach({ targetId }).catch(() => {
-    });
-  }
+  const sessions = frameSessions.get(tabId);
+  if (sessions) for (const frameId of sessions.keys()) frameTargetUrls.delete(frameId);
+  frameSessions.delete(tabId);
+  autoAttachRequested.delete(tabId);
 }
 async function detach(tabId) {
   clearFrameTargetsForTab(tabId);
@@ -790,7 +817,6 @@ function registerListeners() {
       });
       return;
     }
-    if (source.targetId) clearFrameTarget(source.targetId);
   });
   chrome.tabs.onUpdated.addListener(async (tabId, info) => {
     if (info.url && !isDebuggableUrl$1(info.url)) {
@@ -2083,8 +2109,10 @@ function getUrlOrigin(url) {
     return null;
   }
 }
-function enumerateCrossOriginFrames(tree) {
+function enumerateCrossOriginFrames(tree, knownTargets = []) {
   const frames = [];
+  const targetUrlByFrameId = new Map(knownTargets.map((t) => [t.frameId, t.url]));
+  const seenFrameIds = /* @__PURE__ */ new Set();
   function collect(node, accessibleOrigin) {
     for (const child of node.childFrames || []) {
       const frame = child.frame;
@@ -2094,10 +2122,11 @@ function enumerateCrossOriginFrames(tree) {
         collect(child, frameOrigin);
         continue;
       }
+      seenFrameIds.add(frame.id);
       frames.push({
         index: frames.length,
         frameId: frame.id,
-        url: frameUrl,
+        url: targetUrlByFrameId.get(frame.id) || frameUrl,
         name: frame.name || ""
       });
     }
@@ -2105,6 +2134,10 @@ function enumerateCrossOriginFrames(tree) {
   const rootFrame = tree?.frameTree?.frame;
   const rootUrl = rootFrame?.url || rootFrame?.unreachableUrl || "";
   collect(tree.frameTree, getUrlOrigin(rootUrl));
+  for (const target of knownTargets) {
+    if (seenFrameIds.has(target.frameId)) continue;
+    frames.push({ index: frames.length, frameId: target.frameId, url: target.url, name: "" });
+  }
   return frames;
 }
 function setLeaseSession(leaseKey, session) {
@@ -2299,7 +2332,8 @@ async function handleExec(cmd, leaseKey) {
     console.log(`[opencli:exec] start lease=${leaseKey} tab=${tabId} aggressive=${aggressive} frameIndex=${cmd.frameIndex ?? "main"} codeLen=${cmd.code.length}`);
     if (cmd.frameIndex != null) {
       const tree = await getFrameTree(tabId);
-      const frames = enumerateCrossOriginFrames(tree);
+      const knownTargets = await discoverFrameTargets(tabId);
+      const frames = enumerateCrossOriginFrames(tree, knownTargets);
       if (cmd.frameIndex < 0 || cmd.frameIndex >= frames.length) {
         return { id: cmd.id, ok: false, error: `Frame index ${cmd.frameIndex} out of range (${frames.length} cross-origin frames available)` };
       }
@@ -2317,7 +2351,8 @@ async function handleFrames(cmd, leaseKey) {
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     const tree = await getFrameTree(tabId);
-    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree) };
+    const knownTargets = await discoverFrameTargets(tabId);
+    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree, knownTargets) };
   } catch (err) {
     return errorResult(cmd.id, err);
   }

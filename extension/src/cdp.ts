@@ -11,9 +11,16 @@ const attached = new Set<number>();
 const poisonedTabs = new Set<number>();
 
 const tabFrameContexts = new Map<number, Map<string, number>>();
-const frameTargets = new Map<string, string>();
-const frameTargetKeys = new Map<string, string>();
-let frameTargetCleanupRegistered = false;
+// Cross-origin/OOPIF frames are invisible to Page.getFrameTree() and to
+// Target.getTargets()/Target.attachToTarget() from a chrome.debugger tab
+// session (both reject with "Not allowed" — Target.* is locked down for
+// extensions). The only path in is Target.setAutoAttach({flatten:true}) plus
+// the resulting Target.attachedToTarget events, which hand back a flat-session
+// id usable directly in sendCommand({tabId, sessionId}, ...) (Chrome 125+).
+// tabId -> targetId (== frameId for these frame targets) -> flat sessionId.
+const frameSessions = new Map<number, Map<string, string>>();
+const frameTargetUrls = new Map<string, string>();
+const autoAttachRequested = new Set<number>();
 
 // Large cap so agents stop hitting silent JSON.parse failures on real API bodies.
 // See src/browser/cdp.ts CDP_RESPONSE_BODY_CAPTURE_LIMIT for the matching constant
@@ -901,79 +908,73 @@ export async function waitForDownload(pattern: string = '', timeoutMs: number = 
   });
 }
 
-function frameTargetKey(tabId: number, frameId: string): string {
-  return `${tabId}:${frameId}`;
-}
-
-function registerFrameTargetCleanup(): void {
-  if (frameTargetCleanupRegistered) return;
-  frameTargetCleanupRegistered = true;
-  chrome.debugger.onEvent.addListener((_source, method, params: any) => {
-    if (method === 'Target.detachedFromTarget') {
-      const targetId = String(params?.targetId || '');
-      clearFrameTarget(targetId);
-    }
-  });
-}
-
-function clearFrameTarget(targetId: string): void {
-  if (!targetId) return;
-  const key = frameTargetKeys.get(targetId);
-  if (key) frameTargets.delete(key);
-  frameTargetKeys.delete(targetId);
-}
-
-async function ensureFrameTarget(
-  tabId: number,
-  frameId: string,
-  aggressiveRetry: boolean = false,
-  targetUrl?: string,
-): Promise<string> {
-  registerFrameTargetCleanup();
-  await ensureAttached(tabId, aggressiveRetry);
-  const key = frameTargetKey(tabId, frameId);
-  const existing = frameTargets.get(key);
-  if (existing) return existing;
-
-  await sendDebuggerCommand({ tabId }, 'Target.setDiscoverTargets', { discover: true }).catch(() => {});
-  await sendDebuggerCommand({ tabId }, 'Target.setAutoAttach', {
-    autoAttach: true,
-    waitForDebuggerOnStart: false,
-    flatten: true,
-    filter: [{ type: 'iframe', exclude: false }],
-  }).catch(() => {});
-  const targetId = await resolveFrameTargetId(tabId, frameId, targetUrl);
+/**
+ * Kicks off Target.attachedToTarget delivery for a tab's OOPIFs (idempotent —
+ * safe to call on every frame lookup). Chrome then reports both frames that
+ * already existed and ones that attach later via the events wired up in
+ * registerFrameTracking(), which populate frameSessions/frameTargetUrls.
+ */
+async function ensureAutoAttach(tabId: number): Promise<void> {
+  if (autoAttachRequested.has(tabId)) return;
+  autoAttachRequested.add(tabId);
   try {
-    await chrome.debugger.attach({ targetId } as chrome.debugger.Debuggee, '1.3');
+    await sendDebuggerCommand({ tabId }, 'Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+      filter: [{ type: 'iframe', exclude: false }],
+    });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (!message.includes('Another debugger is already attached')) throw err;
+    autoAttachRequested.delete(tabId);
+    throw err;
   }
-  frameTargets.set(key, targetId);
-  frameTargetKeys.set(targetId, key);
-  return targetId;
 }
 
-async function resolveFrameTargetId(tabId: number, frameId: string, targetUrl?: string): Promise<string> {
-  const result = await sendDebuggerCommand({ tabId }, 'Target.getTargets').catch(() => null) as
-    | { targetInfos?: Array<{ targetId?: string; id?: string; type?: string; url?: string }> }
-    | null;
-  const targets = result?.targetInfos ?? [];
-  const frameTarget = targets.find((candidate) => {
-    const candidateId = candidate.targetId || candidate.id;
-    return candidate.type === 'iframe'
-      && (
-        candidateId === frameId
-        || (!!targetUrl && candidate.url === targetUrl)
-      );
-  });
-  const targetId = frameTarget?.targetId || frameTarget?.id;
-  if (targetId) return targetId;
-  const candidates = targets
-    .filter((target) => target.type === 'iframe')
-    .map((target) => `${target.targetId || target.id || '?'} ${target.url || ''}`)
-    .join('; ');
-  throw new Error(`No iframe target found for frame ${frameId}${targetUrl ? ` (${targetUrl})` : ''}. Candidates: ${candidates || 'none'}`);
+/** Cross-origin frame targets discovered so far for a tab, as {frameId, url}. */
+export function getKnownFrameTargets(tabId: number): Array<{ frameId: string; url: string }> {
+  const sessions = frameSessions.get(tabId);
+  if (!sessions) return [];
+  return [...sessions.keys()].map((frameId) => ({ frameId, url: frameTargetUrls.get(frameId) ?? '' }));
+}
+
+/**
+ * Ensures auto-attach is on for a tab and gives Target.attachedToTarget a
+ * brief window to fire for frames that already existed before this call.
+ */
+export async function discoverFrameTargets(tabId: number, timeoutMs: number = 1500): Promise<Array<{ frameId: string; url: string }>> {
+  await ensureAttached(tabId);
+  await ensureAutoAttach(tabId);
+  // Auto-attach cascades one level per round trip (parent attach -> setAutoAttach
+  // on the child session -> grandchild attach event), so a nested iframe-in-iframe
+  // can still be arriving after the first target shows up. Wait until the count
+  // holds steady for two checks in a row, rather than stopping at the first hit.
+  const deadline = Date.now() + timeoutMs;
+  let lastCount = -1;
+  let stableChecks = 0;
+  while (Date.now() < deadline) {
+    const count = frameSessions.get(tabId)?.size ?? 0;
+    if (count > 0 && count === lastCount) {
+      stableChecks += 1;
+      if (stableChecks >= 2) break;
+    } else {
+      stableChecks = 0;
+    }
+    lastCount = count;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return getKnownFrameTargets(tabId);
+}
+
+async function resolveFrameSessionId(tabId: number, frameId: string, timeoutMs: number): Promise<string> {
+  await ensureAutoAttach(tabId);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const sessionId = frameSessions.get(tabId)?.get(frameId);
+    if (sessionId) return sessionId;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const known = getKnownFrameTargets(tabId).map((t) => `${t.frameId} ${t.url}`).join('; ');
+  throw new Error(`No cross-origin frame target found for frame ${frameId}. Candidates: ${known || 'none'}`);
 }
 
 export async function sendCommandInFrameTarget(
@@ -983,10 +984,13 @@ export async function sendCommandInFrameTarget(
   params: Record<string, unknown> = {},
   aggressiveRetry: boolean = false,
   timeoutMs: number = CDP_COMMAND_TIMEOUT_MS,
-  targetUrl?: string,
+  // Unused since frameId now resolves unambiguously via the attachedToTarget
+  // cache — kept so callers passing the CLI's --target-url hint still compile.
+  _targetUrl?: string,
 ): Promise<unknown> {
-  const targetId = await ensureFrameTarget(tabId, frameId, aggressiveRetry, targetUrl);
-  const target = { targetId } as chrome.debugger.Debuggee;
+  await ensureAttached(tabId, aggressiveRetry);
+  const sessionId = await resolveFrameSessionId(tabId, frameId, timeoutMs);
+  const target = { tabId, sessionId } as chrome.debugger.Debuggee;
   return sendDebuggerCommand(target, method, params, timeoutMs);
 }
 
@@ -999,10 +1003,58 @@ export async function insertText(
 }
 
 export function registerFrameTracking(): void {
-  registerFrameTargetCleanup();
   chrome.debugger.onEvent.addListener((source, method, params: any) => {
     const tabId = source.tabId;
     if (!tabId) return;
+
+    if (method === 'Target.attachedToTarget') {
+      const info = params?.targetInfo;
+      const sessionId = params?.sessionId;
+      if (info?.type === 'iframe' && info.targetId && sessionId) {
+        if (!frameSessions.has(tabId)) frameSessions.set(tabId, new Map());
+        frameSessions.get(tabId)!.set(info.targetId, sessionId);
+        frameTargetUrls.set(info.targetId, info.url ?? '');
+        // Auto-attach is not recursive (per Chrome docs) — re-issue it scoped to
+        // this child session so a further-nested iframe (iframe-in-iframe) also
+        // gets discovered instead of silently stopping one level down.
+        sendDebuggerCommand({ tabId, sessionId } as chrome.debugger.Debuggee, 'Target.setAutoAttach', {
+          autoAttach: true,
+          waitForDebuggerOnStart: false,
+          flatten: true,
+          filter: [{ type: 'iframe', exclude: false }],
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    if (method === 'Target.targetInfoChanged') {
+      const info = params?.targetInfo;
+      if (info?.type === 'iframe' && info.targetId) frameTargetUrls.set(info.targetId, info.url ?? '');
+      return;
+    }
+
+    if (method === 'Target.detachedFromTarget') {
+      const sessionId = params?.sessionId;
+      const sessions = frameSessions.get(tabId);
+      if (sessions && sessionId) {
+        for (const [frameId, sid] of sessions) {
+          if (sid === sessionId) { sessions.delete(frameId); frameTargetUrls.delete(frameId); break; }
+        }
+      }
+      return;
+    }
+
+    // Execution context ids are only unique within the session that reported
+    // them. With flatten mode, child (OOPIF) session events flow through this
+    // same listener tagged with source.sessionId — caching their context ids
+    // under the untagged tabId-only key would let evaluateInFrame's fast path
+    // reuse a root-session-scoped id number that happens to collide with one
+    // from a completely different frame. Only the untagged root session's own
+    // contexts belong in this cache; OOPIFs are read via sendCommandInFrameTarget.
+    // @types/chrome predates Chrome 125's flat-session addition of sessionId
+    // to the onEvent source; it's present on the wire even though the type
+    // declares only tabId/extensionId/targetId.
+    if ((source as { sessionId?: string }).sessionId) return;
 
     if (method === 'Runtime.executionContextCreated') {
       const context = params.context;
@@ -1181,12 +1233,10 @@ export function hasActiveNetworkCapture(tabId: number): boolean {
 }
 
 function clearFrameTargetsForTab(tabId: number): void {
-  for (const [key, targetId] of [...frameTargets.entries()]) {
-    if (!key.startsWith(`${tabId}:`)) continue;
-    frameTargets.delete(key);
-    frameTargetKeys.delete(targetId);
-    chrome.debugger.detach({ targetId } as chrome.debugger.Debuggee).catch(() => {});
-  }
+  const sessions = frameSessions.get(tabId);
+  if (sessions) for (const frameId of sessions.keys()) frameTargetUrls.delete(frameId);
+  frameSessions.delete(tabId);
+  autoAttachRequested.delete(tabId);
 }
 
 export async function detach(tabId: number): Promise<void> {
@@ -1224,7 +1274,6 @@ export function registerListeners(): void {
       });
       return;
     }
-    if (source.targetId) clearFrameTarget(source.targetId);
   });
   // Invalidate attached cache when tab URL changes to non-debuggable
   chrome.tabs.onUpdated.addListener(async (tabId, info) => {
