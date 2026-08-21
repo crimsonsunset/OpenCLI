@@ -96,11 +96,9 @@ describe('cdp attach recovery', () => {
   it('falls back to a frame target when no same-target execution context exists', async () => {
     const { chrome, debuggerApi, debuggerEventListeners } = createChromeMock();
     debuggerApi.sendCommand = vi.fn(async (target: any, method: string, _params?: any) => {
-      if (method === 'Target.setDiscoverTargets') return {};
       if (method === 'Target.setAutoAttach') return {};
-      if (method === 'Target.getTargets') return { targetInfos: [{ targetId: 'oopif-frame', type: 'iframe', url: 'https://frame.test' }] };
-      if (target?.targetId === 'oopif-frame' && method === 'Runtime.enable') return {};
-      if (target?.targetId === 'oopif-frame' && method === 'Runtime.evaluate') {
+      if (target?.sessionId === 'oopif-session' && method === 'Runtime.enable') return {};
+      if (target?.sessionId === 'oopif-session' && method === 'Runtime.evaluate') {
         return { result: { value: 'frame-ok' } };
       }
       if (method === 'Runtime.evaluate') return { result: { value: 'root-ok' } };
@@ -111,12 +109,23 @@ describe('cdp attach recovery', () => {
     const mod = await import('./cdp');
     mod.registerFrameTracking();
 
-    const result = await mod.evaluateInFrame(1, 'document.title', 'oopif-frame');
+    // chrome.debugger extensions can't reach OOPIFs via Target.getTargets/
+    // Target.attachToTarget (both reject "Not allowed") — the only real path
+    // in is Target.setAutoAttach({flatten:true}) plus this event, which hands
+    // back a flat sessionId usable directly in sendCommand({tabId, sessionId}).
+    const evalPromise = mod.evaluateInFrame(1, 'document.title', 'oopif-frame');
+    for (const listener of debuggerEventListeners) {
+      listener(
+        { tabId: 1 },
+        'Target.attachedToTarget',
+        { targetInfo: { targetId: 'oopif-frame', type: 'iframe', url: 'https://frame.test' }, sessionId: 'oopif-session' },
+      );
+    }
+    const result = await evalPromise;
 
     expect(result).toBe('frame-ok');
-    expect(debuggerApi.attach).toHaveBeenCalledWith({ targetId: 'oopif-frame' }, '1.3');
     expect(debuggerApi.sendCommand).toHaveBeenCalledWith(
-      { targetId: 'oopif-frame' },
+      { tabId: 1, sessionId: 'oopif-session' },
       'Runtime.evaluate',
       expect.any(Object),
     );
@@ -573,12 +582,8 @@ describe('cdp evaluateInFrame stale context fallback', () => {
         if (method === 'Runtime.evaluate' && params?.contextId === 99) {
           throw new Error('Cannot find context with specified id');
         }
-        if (method === 'Target.setDiscoverTargets') return {};
         if (method === 'Target.setAutoAttach') return {};
-        if (method === 'Target.getTargets') {
-          return { targetInfos: [{ targetId: 'stale-frame', type: 'iframe', url: 'https://frame.test' }] };
-        }
-        if (target?.targetId === 'stale-frame' && method === 'Runtime.evaluate') {
+        if (target?.sessionId === 'stale-frame-session' && method === 'Runtime.evaluate') {
           return { result: { value: 'frame-ok' } };
         }
         return {};
@@ -602,10 +607,22 @@ describe('cdp evaluateInFrame stale context fallback', () => {
       });
     }
 
-    const result = await mod.evaluateInFrame(1, 'document.title', 'stale-frame');
+    const evalPromise = mod.evaluateInFrame(1, 'document.title', 'stale-frame');
+    for (const fn of debuggerEventListeners) {
+      fn(
+        { tabId: 1 },
+        'Target.attachedToTarget',
+        { targetInfo: { targetId: 'stale-frame', type: 'iframe', url: 'https://frame.test' }, sessionId: 'stale-frame-session' },
+      );
+    }
+    const result = await evalPromise;
 
     expect(result).toBe('frame-ok');
-    expect(debuggerApi.attach).toHaveBeenCalledWith({ targetId: 'stale-frame' }, '1.3');
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith(
+      { tabId: 1, sessionId: 'stale-frame-session' },
+      'Runtime.evaluate',
+      expect.any(Object),
+    );
   });
 });
 

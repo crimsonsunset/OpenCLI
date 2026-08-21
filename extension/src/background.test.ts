@@ -39,6 +39,7 @@ function mockCdpModule(overrides: Record<string, unknown> = {}) {
     hasActiveNetworkCapture: vi.fn(() => false),
     detach: vi.fn(async () => {}),
     ensureAttached: vi.fn(async () => {}),
+    discoverFrameTargets: vi.fn(async () => []),
     isTabPoisoned: vi.fn(() => false),
     markTabPoisoned: vi.fn(),
     clearTabPoison: vi.fn(),
