@@ -13,9 +13,12 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     rollupOptions: {
-      input: resolve(__dirname, 'src/background.ts'),
+      input: {
+        background: resolve(__dirname, 'src/background.ts'),
+        'content-bridge': resolve(__dirname, 'src/content-bridge.ts'),
+      },
       output: {
-        entryFileNames: 'background.js',
+        entryFileNames: '[name].js',
         format: 'es',
       },
     },

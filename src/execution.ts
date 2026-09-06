@@ -67,8 +67,11 @@ export function coerceAndValidateArgs(cmdArgs: Arg[], kwargs: CommandArgs): Comm
     if (val !== undefined && val !== null) {
       if (argDef.type === 'int' || argDef.type === 'number') {
         const num = Number(val);
-        if (Number.isNaN(num)) {
+        if (!Number.isFinite(num)) {
           throw new ArgumentError(`Argument "${argDef.name}" must be a valid number. Received: "${val}"`);
+        }
+        if (argDef.type === 'int' && !Number.isInteger(num)) {
+          throw new ArgumentError(`Argument "${argDef.name}" must be a valid integer. Received: "${val}"`);
         }
         result[argDef.name] = num;
       } else if (argDef.type === 'boolean' || argDef.type === 'bool') {
@@ -208,6 +211,13 @@ export async function executeCommand(
     onTraceExport?: (trace: ObservationExportResult) => void;
   } = {},
 ): Promise<unknown> {
+  // Resolve browser-only configuration before argument hooks or any browser
+  // lifecycle setup. Non-browser commands must not be affected by browser
+  // environment defaults, even when those defaults are invalid.
+  const siteSession = shouldUseBrowserSession(cmd)
+    ? resolveSiteSession(cmd, opts.siteSession)
+    : null;
+
   let kwargs: CommandArgs;
   try {
     kwargs = opts.prepared ? rawKwargs : prepareCommandArgs(cmd, rawKwargs);
@@ -233,7 +243,7 @@ export async function executeCommand(
 
   let result: unknown;
   try {
-    if (shouldUseBrowserSession(cmd)) {
+    if (siteSession !== null) {
       const electron = isElectronApp(cmd.site);
       let cdpEndpoint: string | undefined;
 
@@ -261,7 +271,6 @@ export async function executeCommand(
       const profileRouting = profileRouteParams(profileSelection);
       const contextId = profileSelection?.contextId;
       const internal = cmd as InternalCliCommand;
-      const siteSession = resolveSiteSession(cmd, opts.siteSession);
       const session = resolveAdapterBrowserSession(cmd, siteSession);
       const keepTab = resolveKeepTab(siteSession, opts.keepTab);
       const windowMode = resolveBrowserWindowMode(cmd.defaultWindowMode ?? 'background', opts.windowMode);
@@ -269,11 +278,17 @@ export async function executeCommand(
       // session so a concurrent retry fails fast instead of driving the same
       // Chrome tab. The runId flows to the daemon on every command (acquire +
       // heartbeat); we release it explicitly when the command settles. Read and
-      // ephemeral commands are never leased.
-      const leaseRun = siteSession === 'persistent' && cmd.access === 'write'
+      // ephemeral commands are never leased — but every browser run still sets
+      // access on the run context so mid-command detach can be retried for reads.
+      const access = cmd.access === 'write' ? 'write' : 'read';
+      const leaseRun = siteSession === 'persistent' && access === 'write'
         ? { runId: generateRunId(), session }
         : null;
-      if (leaseRun) setDaemonRunContext({ runId: leaseRun.runId, command: fullName(cmd), access: 'write' });
+      setDaemonRunContext({
+        ...(leaseRun ? { runId: leaseRun.runId } : {}),
+        command: fullName(cmd),
+        access,
+      });
       let browserRunError: unknown;
       // `as` casts defeat literal narrowing: both are assigned only inside the
       // browserSession callback, which TS's flow analysis does not see from the
@@ -454,6 +469,8 @@ export async function executeCommand(
               await releaseSiteSessionLease({ runId: leaseRun.runId, session: leaseRun.session, surface: 'adapter' });
             }
           }
+        } else {
+          setDaemonRunContext(null);
         }
       }
     } else {
@@ -573,14 +590,17 @@ export function prepareCommandArgs(
  */
 const RUNTIME_TIMEOUT_PADDING_SECONDS = 30;
 
-function normalizeSiteSession(raw: unknown): SiteSessionMode | null {
-  if (raw === undefined || raw === null || raw === '') return null;
+function normalizeSiteSession(name: string, raw: unknown): SiteSessionMode | null {
+  if (raw === undefined) return null;
   if (raw === 'ephemeral' || raw === 'persistent') return raw;
-  throw new ArgumentError(`--site-session must be one of: ephemeral, persistent. Received: "${String(raw)}"`);
+  throw new ArgumentError(`${name} must be one of: ephemeral, persistent. Received: "${String(raw)}"`);
 }
 
 function resolveSiteSession(cmd: CliCommand, rawOption?: unknown): SiteSessionMode {
-  return normalizeSiteSession(rawOption) ?? cmd.siteSession ?? 'ephemeral';
+  return normalizeSiteSession('--site-session', rawOption)
+    ?? normalizeSiteSession('OPENCLI_SITE_SESSION', process.env.OPENCLI_SITE_SESSION)
+    ?? cmd.siteSession
+    ?? 'ephemeral';
 }
 
 function resolveAdapterBrowserSession(cmd: CliCommand, siteSession: SiteSessionMode): string {

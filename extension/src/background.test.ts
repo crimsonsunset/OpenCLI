@@ -28,6 +28,27 @@ const leaseKey = (surface: 'browser' | 'adapter', session: string): string =>
 const browserKey = (session: string): string => leaseKey('browser', session);
 const adapterKey = (session: string): string => leaseKey('adapter', session);
 
+/**
+ * Baseline CDP mock required by tab lease resolution and Amazon post-nav quiet.
+ * @param overrides - Per-test CDP stubs
+ */
+function mockCdpModule(overrides: Record<string, unknown> = {}) {
+  return {
+    registerListeners: vi.fn(),
+    registerFrameTracking: vi.fn(),
+    hasActiveNetworkCapture: vi.fn(() => false),
+    detach: vi.fn(async () => {}),
+    ensureAttached: vi.fn(async () => {}),
+    discoverFrameTargets: vi.fn(async () => []),
+    isTabPoisoned: vi.fn(() => false),
+    markTabPoisoned: vi.fn(),
+    clearTabPoison: vi.fn(),
+    waitForTabQuiet: vi.fn(async () => {}),
+    stripForeignEmbedsViaContent: vi.fn(async () => 0),
+    ...overrides,
+  };
+}
+
 class MockWebSocket {
   static OPEN = 1;
   static CONNECTING = 0;
@@ -269,6 +290,7 @@ describe('background tab isolation', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     vi.clearAllTimers();
     vi.useRealTimers();
+    vi.doUnmock('./cdp');
     vi.unstubAllGlobals();
   });
 
@@ -438,7 +460,7 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const sendCommandInFrameTarget = vi.fn(async () => ({ nodes: [] }));
-    vi.doMock('./cdp', () => ({
+    vi.doMock('./cdp', () => mockCdpModule({
       registerListeners: vi.fn(),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -483,7 +505,7 @@ describe('background tab isolation', () => {
       state: 'complete',
       elapsedMs: 12,
     }));
-    vi.doMock('./cdp', () => ({
+    vi.doMock('./cdp', () => mockCdpModule({
       registerListeners: vi.fn(),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -519,7 +541,7 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const evaluateInFrame = vi.fn(async () => 'frame-result');
-    vi.doMock('./cdp', () => ({
+    vi.doMock('./cdp', () => mockCdpModule({
       registerListeners: vi.fn(),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -527,20 +549,20 @@ describe('background tab isolation', () => {
       evaluateAsync: vi.fn(async () => 'main-result'),
       evaluateInFrame,
       getFrameTree: vi.fn(async () => ({
-        frameTree: {
-          frame: { id: 'root', url: 'https://main.example/' },
-          childFrames: [
-            {
-              frame: { id: 'same-origin-parent', url: 'https://main.example/embed' },
-              childFrames: [
-                { frame: { id: 'cross-origin-nested', url: 'https://x.example/widget', name: 'nested-x' } },
-              ],
-            },
-            {
-              frame: { id: 'cross-origin-sibling', url: 'https://y.example/iframe', name: 'sibling-y' },
-            },
-          ],
-        },
+      frameTree: {
+      frame: { id: 'root', url: 'https://main.example/' },
+      childFrames: [
+      {
+      frame: { id: 'same-origin-parent', url: 'https://main.example/embed' },
+      childFrames: [
+      { frame: { id: 'cross-origin-nested', url: 'https://x.example/widget', name: 'nested-x' } },
+      ],
+      },
+      {
+      frame: { id: 'cross-origin-sibling', url: 'https://y.example/iframe', name: 'sibling-y' },
+      },
+      ],
+      },
       })),
       screenshot: vi.fn(),
       setFileInputFiles: vi.fn(),
@@ -578,7 +600,7 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const evaluateAsync = vi.fn(async () => 'main-result');
-    vi.doMock('./cdp', () => ({
+    vi.doMock('./cdp', () => mockCdpModule({
       registerListeners: vi.fn(),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),
@@ -592,6 +614,9 @@ describe('background tab isolation', () => {
       startNetworkCapture: vi.fn(),
       readNetworkCapture: vi.fn(async () => []),
       ensureAttached: vi.fn(),
+      isTabPoisoned: vi.fn(() => false),
+      markTabPoisoned: vi.fn(),
+      clearTabPoison: vi.fn(),
     }));
 
     const mod = await import('./background');
@@ -618,6 +643,48 @@ describe('background tab isolation', () => {
       timeout: 8,
     });
     expect(evaluateAsync).toHaveBeenLastCalledWith(1, '1', false, 10_000);
+  });
+
+  it('uses aggressive attach for Amazon adapter sessions but not other adapters', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const evaluateAsync = vi.fn(async () => 'main-result');
+    vi.doMock('./cdp', () => mockCdpModule({
+      registerListeners: vi.fn(),
+      registerFrameTracking: vi.fn(),
+      hasActiveNetworkCapture: vi.fn(() => false),
+      detach: vi.fn(async () => {}),
+      evaluateAsync,
+      evaluateInFrame: vi.fn(),
+      getFrameTree: vi.fn(),
+      screenshot: vi.fn(),
+      setFileInputFiles: vi.fn(),
+      insertText: vi.fn(),
+      startNetworkCapture: vi.fn(),
+      readNetworkCapture: vi.fn(async () => []),
+      ensureAttached: vi.fn(),
+      isTabPoisoned: vi.fn(() => false),
+      markTabPoisoned: vi.fn(),
+      clearTabPoison: vi.fn(),
+    }));
+
+    const mod = await import('./background');
+    expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:amazon:abc'))).toBe(true);
+    expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:amazon'))).toBe(true);
+    expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:twitter:abc'))).toBe(false);
+    expect(mod.__test__.shouldUseAggressiveAttach(browserKey('main'))).toBe(true);
+
+    mod.__test__.setAutomationWindowId(adapterKey('site:amazon:abc'), 1);
+    await mod.__test__.handleCommand({
+      id: 'amazon-exec',
+      action: 'exec',
+      code: '1',
+      session: 'site:amazon:abc',
+      surface: 'adapter',
+      timeout: 120,
+    });
+    expect(evaluateAsync).toHaveBeenLastCalledWith(1, '1', true, 115_000);
   });
 
   it('creates new tabs inside the automation container', async () => {
@@ -667,6 +734,85 @@ describe('background tab isolation', () => {
       data: { closed: 'target-1' },
     });
     expect(chrome.tabs.remove).toHaveBeenCalledWith(1);
+  });
+
+  it('closes an exact non-preferred owned page without releasing the preferred lease', async () => {
+    const { chrome, tabs } = createChromeMock();
+    tabs.push({ id: 10, windowId: 1, url: 'https://fresh.example', title: 'fresh', active: true, status: 'complete', groupId: -1 });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setSession(adapterKey('twitter'), { windowId: 1, owned: true, preferredTabId: 10 });
+
+    const result = await mod.__test__.handleTabs(
+      { id: 'close-old', action: 'tabs', op: 'close', session: adapterKey('twitter'), page: 'target-1' },
+      adapterKey('twitter'),
+    );
+
+    expect(result).toEqual({
+      id: 'close-old',
+      ok: true,
+      data: { closed: 'target-1' },
+    });
+    expect(chrome.tabs.remove).toHaveBeenCalledWith(1);
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(10, { url: 'about:blank', active: true });
+    expect(mod.__test__.getSession(adapterKey('twitter'))?.preferredTabId).toBe(10);
+  });
+
+  it.each([
+    ['cross-window', 'target-2'],
+    ['stale', 'target-999'],
+  ])('rejects an exact %s page without closing the preferred page', async (_label, page) => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setSession(adapterKey('twitter'), { windowId: 1, owned: true, preferredTabId: 1 });
+
+    const result = await mod.__test__.handleTabs(
+      { id: 'reject-close', action: 'tabs', op: 'close', session: adapterKey('twitter'), page },
+      adapterKey('twitter'),
+    );
+
+    expect(result).toEqual(expect.objectContaining({ id: 'reject-close', ok: false }));
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
+    expect(mod.__test__.getSession(adapterKey('twitter'))?.preferredTabId).toBe(1);
+  });
+
+  it('keeps legacy implicit close bound to the preferred page', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setSession(adapterKey('twitter'), { windowId: 1, owned: true, preferredTabId: 1 });
+
+    const result = await mod.__test__.handleTabs(
+      { id: 'implicit-close', action: 'tabs', op: 'close', session: adapterKey('twitter') },
+      adapterKey('twitter'),
+    );
+
+    expect(result).toEqual({ id: 'implicit-close', ok: true, data: { closed: 'target-1' } });
+    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
+    expect(mod.__test__.getSession(adapterKey('twitter'))).toBeNull();
+  });
+
+  it('selecting an exact owned page restores it as the preferred lease target', async () => {
+    const { chrome, tabs } = createChromeMock();
+    tabs.push({ id: 10, windowId: 1, url: 'https://fresh.example', title: 'fresh', active: true, status: 'complete', groupId: -1 });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setSession(adapterKey('twitter'), { windowId: 1, owned: true, preferredTabId: 10 });
+
+    const result = await mod.__test__.handleTabs(
+      { id: 'restore-old', action: 'tabs', op: 'select', session: adapterKey('twitter'), page: 'target-1' },
+      adapterKey('twitter'),
+    );
+
+    expect(result).toEqual(expect.objectContaining({ id: 'restore-old', ok: true, page: 'target-1' }));
+    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { active: true });
+    expect(mod.__test__.getSession(adapterKey('twitter'))?.preferredTabId).toBe(1);
   });
 
   it('treats normalized same-url navigate as already complete', async () => {
@@ -719,7 +865,7 @@ describe('background tab isolation', () => {
     vi.stubGlobal('chrome', chrome);
 
     const detachMock = vi.fn(async () => {});
-    vi.doMock('./cdp', () => ({
+    vi.doMock('./cdp', () => mockCdpModule({
       registerListeners: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => true),
       detach: detachMock,
@@ -877,6 +1023,30 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getReconnectAttempts()).toBe(0);
   });
 
+  it('pings without credentials and logs a non-OK status instead of swallowing it', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.fn(async () => ({ ok: false, status: 431 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await import('./background');
+
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalled();
+    });
+
+    // The ping must not attach the localhost cookie jar — that is what pushes
+    // the request past Node's header limit and makes the daemon answer 431.
+    expect(fetchMock.mock.calls[0][1]).toMatchObject({ credentials: 'omit' });
+    // A non-OK ping must be logged, not silently swallowed.
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('HTTP 431'));
+    // The WebSocket must not be attempted after a failed ping.
+    expect(MockWebSocket.instances).toHaveLength(0);
+
+    warnSpy.mockRestore();
+  });
+
   it('ignores daemon commands delivered to a superseded WebSocket', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
@@ -924,14 +1094,14 @@ describe('background tab isolation', () => {
 
     let inFlight = 0;
     let maxInFlight = 0;
-    vi.doMock('./cdp', () => ({
+    vi.doMock('./cdp', () => mockCdpModule({
       registerListeners: vi.fn(),
       evaluateAsync: vi.fn(async (tabId: number, code: string) => {
-        inFlight++;
-        maxInFlight = Math.max(maxInFlight, inFlight);
-        await new Promise(resolve => setTimeout(resolve, 30));
-        inFlight--;
-        return { tabId, code };
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      inFlight--;
+      return { tabId, code };
       }),
     }));
 
@@ -962,14 +1132,14 @@ describe('background tab isolation', () => {
 
     let inFlight = 0;
     let maxInFlight = 0;
-    vi.doMock('./cdp', () => ({
+    vi.doMock('./cdp', () => mockCdpModule({
       registerListeners: vi.fn(),
       evaluateAsync: vi.fn(async (tabId: number, code: string) => {
-        inFlight++;
-        maxInFlight = Math.max(maxInFlight, inFlight);
-        await new Promise(resolve => setTimeout(resolve, 30));
-        inFlight--;
-        return { tabId, code };
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      inFlight--;
+      return { tabId, code };
       }),
     }));
 
@@ -1879,7 +2049,7 @@ describe('background tab isolation', () => {
   it('allows navigation but blocks tab mutation on borrowed sessions', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
-    vi.doMock('./cdp', () => ({
+    vi.doMock('./cdp', () => mockCdpModule({
       registerListeners: vi.fn(),
       registerFrameTracking: vi.fn(),
       hasActiveNetworkCapture: vi.fn(() => false),

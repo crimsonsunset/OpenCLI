@@ -15,7 +15,7 @@ import { buildEvaluateExpression } from './utils.js';
 import { saveBase64ToFile } from '../utils.js';
 import { generateStealthJs } from './stealth.js';
 import { waitForDomStableJs } from './dom-helpers.js';
-import { BasePage } from './base-page.js';
+import { CDPBasePage } from './base-page.js';
 import { classifyBrowserError } from './errors.js';
 import { log } from '../logger.js';
 
@@ -39,7 +39,7 @@ function isStalePageIdentityError(err: unknown): boolean {
 /**
  * Page — implements IPage by talking to the daemon via HTTP.
  */
-export class Page extends BasePage {
+export class Page extends CDPBasePage {
   private readonly _idleTimeout: number | undefined;
 
   constructor(
@@ -118,12 +118,8 @@ export class Page extends BasePage {
     if (options?.waitUntil !== 'none') {
       const maxMs = options?.settleMs ?? 1000;
       const combinedCode = `${generateStealthJs()};\n${waitForDomStableJs(maxMs, Math.min(500, maxMs))}`;
-      const combinedOpts = {
-        code: combinedCode,
-        ...this._cmdOpts(),
-      };
       try {
-        await sendCommand('exec', combinedOpts);
+        await this._execRememberPage(combinedCode);
       } catch (err) {
         const advice = classifyBrowserError(err);
         // Only settle-retry on target navigation (SPA client-side redirects).
@@ -132,7 +128,7 @@ export class Page extends BasePage {
         if (advice.kind !== 'target-navigation') throw err;
         try {
           await new Promise((r) => setTimeout(r, advice.delayMs));
-          await sendCommand('exec', combinedOpts);
+          await this._execRememberPage(combinedCode);
         } catch (retryErr) {
           if (classifyBrowserError(retryErr).kind !== 'target-navigation') throw retryErr;
         }
@@ -140,10 +136,7 @@ export class Page extends BasePage {
     } else {
       // Even with waitUntil='none', still inject stealth (best-effort)
       try {
-        await sendCommand('exec', {
-          code: generateStealthJs(),
-          ...this._cmdOpts(),
-        });
+        await this._execRememberPage(generateStealthJs());
       } catch {
         // Non-fatal: stealth is best-effort
       }
@@ -170,17 +163,31 @@ export class Page extends BasePage {
     );
   }
 
+  /**
+   * Run exec and adopt any updated page identity (e.g. after CDP poison tab replace).
+   * @param code - JS payload for the extension Runtime.evaluate / scripting path
+   * @param extra - Extra daemon command fields (frameIndex, etc.)
+   */
+  private async _execRememberPage(
+    code: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<unknown> {
+    const result = await sendCommandFull('exec', { code, ...this._cmdOpts(), ...extra });
+    if (result.page) this._page = result.page;
+    return result.data;
+  }
+
   async evaluate<T = unknown>(js: string): Promise<T>;
   async evaluate<Args extends unknown[], T>(fn: BrowserEvaluateFunction<Args, T>, ...args: Args): Promise<Awaited<T>>;
   async evaluate(input: string | BrowserEvaluateFunction<unknown[], unknown>, ...args: unknown[]): Promise<unknown> {
     const code = buildEvaluateExpression(input, args);
     try {
-      return await sendCommand('exec', { code, ...this._cmdOpts() });
+      return await this._execRememberPage(code);
     } catch (err) {
       const advice = classifyBrowserError(err);
       if (advice.kind !== 'target-navigation') throw err;
       await new Promise((resolve) => setTimeout(resolve, advice.delayMs));
-      return sendCommand('exec', { code, ...this._cmdOpts() });
+      return this._execRememberPage(code);
     }
   }
 
@@ -345,23 +352,6 @@ export class Page extends BasePage {
     });
   }
 
-  async handleJavaScriptDialog(accept: boolean, promptText?: string): Promise<void> {
-    await this.cdp('Page.handleJavaScriptDialog', {
-      accept,
-      ...(promptText !== undefined && { promptText }),
-    });
-  }
-
-  /** CDP native click fallback — called when JS el.click() fails */
-  protected override async tryNativeClick(x: number, y: number): Promise<boolean> {
-    try {
-      await this.nativeClick(x, y);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   /** Precise click using DOM.getContentQuads/getBoxModel for inline elements */
   async clickWithQuads(ref: string): Promise<void> {
     const safeRef = JSON.stringify(ref);
@@ -424,48 +414,4 @@ export class Page extends BasePage {
     `);
   }
 
-  async nativeClick(x: number, y: number): Promise<void> {
-    await this.cdp('Input.dispatchMouseEvent', {
-      type: 'mouseMoved',
-      x,
-      y,
-    });
-    await this.cdp('Input.dispatchMouseEvent', {
-      type: 'mousePressed',
-      x, y,
-      button: 'left',
-      clickCount: 1,
-    });
-    await this.cdp('Input.dispatchMouseEvent', {
-      type: 'mouseReleased',
-      x, y,
-      button: 'left',
-      clickCount: 1,
-    });
-  }
-
-  async nativeType(text: string): Promise<void> {
-    // Use Input.insertText for reliable Unicode/CJK text insertion
-    await this.cdp('Input.insertText', { text });
-  }
-
-  async nativeKeyPress(key: string, modifiers: string[] = []): Promise<void> {
-    let modifierFlags = 0;
-    for (const mod of modifiers) {
-      if (mod === 'Alt') modifierFlags |= 1;
-      if (mod === 'Ctrl' || mod === 'Control') modifierFlags |= 2;
-      if (mod === 'Meta') modifierFlags |= 4;
-      if (mod === 'Shift') modifierFlags |= 8;
-    }
-    await this.cdp('Input.dispatchKeyEvent', {
-      type: 'keyDown',
-      key,
-      modifiers: modifierFlags,
-    });
-    await this.cdp('Input.dispatchKeyEvent', {
-      type: 'keyUp',
-      key,
-      modifiers: modifierFlags,
-    });
-  }
 }

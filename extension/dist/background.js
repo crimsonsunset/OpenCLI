@@ -4,10 +4,11 @@ const DAEMON_WS_URL = `ws://${DAEMON_HOST}:${DAEMON_PORT}/ext`;
 const DAEMON_PING_URL = `http://${DAEMON_HOST}:${DAEMON_PORT}/ping`;
 
 const attached = /* @__PURE__ */ new Set();
+const poisonedTabs = /* @__PURE__ */ new Set();
 const tabFrameContexts = /* @__PURE__ */ new Map();
-const frameTargets = /* @__PURE__ */ new Map();
-const frameTargetKeys = /* @__PURE__ */ new Map();
-let frameTargetCleanupRegistered = false;
+const frameSessions = /* @__PURE__ */ new Map();
+const frameTargetUrls = /* @__PURE__ */ new Map();
+const autoAttachRequested = /* @__PURE__ */ new Set();
 const CDP_RESPONSE_BODY_CAPTURE_LIMIT = 8 * 1024 * 1024;
 const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
 const networkCaptures = /* @__PURE__ */ new Map();
@@ -35,9 +36,87 @@ function isDebuggableUrl$1(url) {
   if (!url) return true;
   return url.startsWith("http://") || url.startsWith("https://") || url === "about:blank" || url.startsWith("data:");
 }
+async function describeAttachTargets(tabId) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    const targets = await chrome.debugger.getTargets();
+    const onTab = targets.filter((t) => t.tabId === tabId);
+    const foreignExtOnTab = onTab.filter((t) => typeof t.url === "string" && t.url.startsWith("chrome-extension://") && !t.url.startsWith(`chrome-extension://${chrome.runtime.id}/`));
+    const pageAttachedElsewhere = onTab.some((t) => t.type === "page" && t.attached && !attached.has(tabId));
+    const summary = {
+      tabId,
+      tabUrl: tab.url ?? null,
+      tabStatus: tab.status ?? null,
+      windowId: tab.windowId,
+      attachedCache: attached.has(tabId),
+      poisoned: poisonedTabs.has(tabId),
+      pageAttachedElsewhere,
+      onTabCount: onTab.length,
+      foreignExtOnTabCount: foreignExtOnTab.length,
+      foreignExtOnTab: foreignExtOnTab.slice(0, 20).map((t) => ({
+        type: t.type,
+        attached: t.attached,
+        url: t.url?.slice(0, 180)
+      })),
+      onTab: onTab.slice(0, 20).map((t) => ({
+        type: t.type,
+        attached: t.attached,
+        url: t.url?.slice(0, 160)
+      }))
+    };
+    return JSON.stringify(summary);
+  } catch (err) {
+    return JSON.stringify({
+      tabId,
+      describeError: err instanceof Error ? err.message : String(err)
+    });
+  }
+}
+function markTabPoisoned(tabId, reason) {
+  poisonedTabs.add(tabId);
+  attached.delete(tabId);
+  console.warn(`[opencli:attach] poisoned tab=${tabId} reason=${reason}`);
+}
+async function waitForTabQuiet(tabId, quietMs = 1200, maxMs = 1e4) {
+  const startedAt = Date.now();
+  let quietSince = null;
+  while (Date.now() - startedAt < maxMs) {
+    let status = "unknown";
+    let url = "unknown";
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      status = tab.status ?? "unknown";
+      url = tab.url ?? "unknown";
+    } catch {
+      console.warn(`[opencli:attach] waitForTabQuiet tab gone tab=${tabId}`);
+      return;
+    }
+    if (status === "complete") {
+      if (quietSince === null) quietSince = Date.now();
+      if (Date.now() - quietSince >= quietMs) {
+        console.log(`[opencli:attach] tab quiet tab=${tabId} url=${url} waited=${Date.now() - startedAt}ms`);
+        return;
+      }
+    } else {
+      if (quietSince !== null) {
+        console.log(`[opencli:attach] quiet broken tab=${tabId} status=${status} url=${url}`);
+      }
+      quietSince = null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  console.warn(`[opencli:attach] waitForTabQuiet timed out tab=${tabId} after ${maxMs}ms`);
+}
+function isTabPoisoned(tabId) {
+  return poisonedTabs.has(tabId);
+}
+function clearTabPoison(tabId) {
+  poisonedTabs.delete(tabId);
+}
 async function ensureAttached(tabId, aggressiveRetry = false) {
   try {
     const tab = await chrome.tabs.get(tabId);
+    console.log(`[opencli:attach] begin tab=${tabId} aggressive=${aggressiveRetry} url=${tab.url ?? "unknown"} status=${tab.status ?? "?"} cache=${attached.has(tabId)}`);
     if (!isDebuggableUrl$1(tab.url)) {
       attached.delete(tabId);
       throw new Error(`Cannot debug tab ${tabId}: URL is ${tab.url ?? "unknown"}`);
@@ -53,8 +132,11 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
         expression: "1",
         returnByValue: true
       }, CDP_PROBE_TIMEOUT_MS);
+      console.log(`[opencli:attach] health-check ok tab=${tabId}`);
       return;
-    } catch {
+    } catch (probeErr) {
+      const probeMsg = probeErr instanceof Error ? probeErr.message : String(probeErr);
+      console.warn(`[opencli:attach] health-check failed tab=${tabId}: ${probeMsg}`);
       attached.delete(tabId);
     }
   }
@@ -66,16 +148,31 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     try {
       try {
         await chrome.debugger.detach({ tabId });
-      } catch {
+        console.log(`[opencli:attach] pre-detach ok tab=${tabId} attempt=${attempt}`);
+      } catch (detachErr) {
+        const detachMsg = detachErr instanceof Error ? detachErr.message : String(detachErr);
+        console.log(`[opencli:attach] pre-detach noop tab=${tabId} attempt=${attempt}: ${detachMsg}`);
       }
       await chrome.debugger.attach({ tabId }, "1.3");
+      console.log(`[opencli:attach] attach ok tab=${tabId} attempt=${attempt}/${MAX_ATTACH_RETRIES}`);
       lastError = "";
       break;
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
+      const targets = await describeAttachTargets(tabId);
+      console.warn(`[opencli:attach] attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError} targets=${targets}`);
+      if (lastError.includes("chrome-extension://")) {
+        await stripForeignEmbedsViaContent(tabId);
+      }
       if (attempt < MAX_ATTACH_RETRIES) {
-        console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${RETRY_DELAY_MS}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+        const delayMs = lastError.includes("chrome-extension://") && aggressiveRetry ? 200 : RETRY_DELAY_MS;
+        const maxAttempts = lastError.includes("chrome-extension://") && aggressiveRetry ? Math.min(MAX_ATTACH_RETRIES, 2) : MAX_ATTACH_RETRIES;
+        if (attempt >= maxAttempts) {
+          console.warn(`[opencli:attach] giving up early for content-bridge fallback tab=${tabId}`);
+          break;
+        }
+        console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${delayMs}ms...`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
         try {
           const tab = await chrome.tabs.get(tabId);
           if (!isDebuggableUrl$1(tab.url)) {
@@ -97,14 +194,23 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
       finalWindowId = String(tab.windowId);
     } catch {
     }
-    console.warn(`[opencli] attach failed for tab ${tabId}: url=${finalUrl}, windowId=${finalWindowId}, error=${lastError}`);
+    const targets = await describeAttachTargets(tabId);
+    console.error(`[opencli:attach] FAILED tab=${tabId} url=${finalUrl} windowId=${finalWindowId} error=${lastError} targets=${targets}`);
+    if (!aggressiveRetry && (lastError.includes("chrome-extension://") || lastError.includes("Another debugger is already attached"))) {
+      markTabPoisoned(tabId, `attach-failed:${lastError.slice(0, 80)}`);
+    }
     const hint = lastError.includes("chrome-extension://") ? ". Tip: another Chrome extension may be interfering — try disabling other extensions" : "";
-    throw new Error(`attach failed: ${lastError}${hint}`);
+    throw new Error(`attach failed: ${lastError} (tab=${tabId} url=${finalUrl} windowId=${finalWindowId})${hint}`);
   }
   attached.add(tabId);
+  poisonedTabs.delete(tabId);
   try {
+    console.log(`[opencli:attach] Runtime.enable begin tab=${tabId}`);
     await sendDebuggerCommand({ tabId }, "Runtime.enable");
-  } catch {
+    console.log(`[opencli:attach] Runtime.enable ok tab=${tabId}`);
+  } catch (enableErr) {
+    const enableMsg = enableErr instanceof Error ? enableErr.message : String(enableErr);
+    console.warn(`[opencli:attach] Runtime.enable failed tab=${tabId}: ${enableMsg}`);
   }
   if (preservedNetworkCapture) {
     try {
@@ -114,25 +220,141 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     }
   }
 }
-async function evaluate(tabId, expression, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
+async function evaluateOnce(tabId, expression, aggressiveRetry, timeoutMs, startedAt) {
+  await ensureAttached(tabId, aggressiveRetry);
+  console.log(`[opencli:eval] Runtime.evaluate begin tab=${tabId} codeLen=${expression.length} t+${Date.now() - startedAt}ms`);
+  const result = await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: true
+  }, timeoutMs);
+  if (result.exceptionDetails) {
+    const errMsg = result.exceptionDetails.exception?.description || result.exceptionDetails.text || "Eval error";
+    throw new Error(errMsg);
+  }
+  console.log(`[opencli:eval] Runtime.evaluate ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+  return result.result?.value;
+}
+async function stripForeignEmbedsViaContent(tabId) {
   try {
-    await ensureAttached(tabId, aggressiveRetry);
-    const result = await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
-      expression,
-      returnByValue: true,
-      awaitPromise: true
-    }, timeoutMs);
-    if (result.exceptionDetails) {
-      const errMsg = result.exceptionDetails.exception?.description || result.exceptionDetails.text || "Eval error";
-      throw new Error(errMsg);
+    const response = await chrome.tabs.sendMessage(tabId, { type: "opencli:strip-frames" });
+    const removed = response?.removed ?? 0;
+    console.log(`[opencli:attach] content strip-frames tab=${tabId} removed=${removed}`);
+    return removed;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[opencli:attach] content strip-frames unavailable tab=${tabId}: ${msg}`);
+    return 0;
+  }
+}
+async function evaluateViaUserScripts(tabId, expression, startedAt) {
+  if (!chrome.userScripts?.execute) {
+    throw new Error(
+      'userScripts.execute unavailable — enable "Allow User Scripts" on the OpenCLI extension details page, then reload'
+    );
+  }
+  console.warn(`[opencli:eval] userScripts fallback begin tab=${tabId} codeLen=${expression.length} t+${Date.now() - startedAt}ms`);
+  await waitForTabQuiet(tabId, 400, 4e3);
+  await stripForeignEmbedsViaContent(tabId);
+  const results = await chrome.userScripts.execute({
+    target: { tabId },
+    world: "USER_SCRIPT",
+    injectImmediately: true,
+    js: [{ code: expression }]
+  });
+  const injection = results?.[0];
+  if (injection?.error) {
+    throw new Error(String(injection.error));
+  }
+  console.log(`[opencli:eval] userScripts fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+  return injection?.result;
+}
+async function evaluateViaScriptingWorld(tabId, expression, world) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world,
+    args: [expression],
+    func: async (code) => {
+      try {
+        const value = await (0, eval)(code);
+        return { __opencli: true, ok: true, value };
+      } catch (err) {
+        return {
+          __opencli: true,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err)
+        };
+      }
     }
-    return result.result?.value;
+  });
+  const wrapped = injection?.result;
+  if (!wrapped || wrapped.__opencli !== true) {
+    throw new Error("scripting fallback returned no result (likely CSP-blocked eval)");
+  }
+  if (!wrapped.ok) {
+    throw new Error(wrapped.error || "scripting fallback eval failed");
+  }
+  return wrapped.value;
+}
+function isPreEvalAttachFailure(message) {
+  return message.includes("attach failed") || message.includes("Debugger is not attached");
+}
+async function evaluateViaFallbacks(tabId, expression, startedAt) {
+  const hasScripting = typeof chrome.scripting?.executeScript === "function";
+  if (hasScripting) {
+    try {
+      console.warn(`[opencli:eval] scripting MAIN fallback begin tab=${tabId}`);
+      await waitForTabQuiet(tabId, 400, 4e3);
+      const value = await evaluateViaScriptingWorld(tabId, expression, "MAIN");
+      console.log(`[opencli:eval] scripting MAIN fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+      return value;
+    } catch (scriptErr) {
+      const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
+      console.warn(`[opencli:eval] scripting MAIN fallback failed tab=${tabId}: ${scriptMsg}`);
+    }
+  }
+  try {
+    return await evaluateViaUserScripts(tabId, expression, startedAt);
+  } catch (userScriptErr) {
+    const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
+    console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+  }
+  if (hasScripting) {
+    try {
+      console.warn(`[opencli:eval] scripting ISOLATED fallback begin tab=${tabId}`);
+      await waitForTabQuiet(tabId, 400, 4e3);
+      const value = await evaluateViaScriptingWorld(tabId, expression, "ISOLATED");
+      console.log(`[opencli:eval] scripting ISOLATED fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
+      return value;
+    } catch (scriptErr) {
+      const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
+      console.warn(`[opencli:eval] scripting ISOLATED fallback failed tab=${tabId}: ${scriptMsg}`);
+    }
+  }
+  throw new Error("all non-CDP eval fallbacks failed");
+}
+async function evaluate(tabId, expression, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS) {
+  const startedAt = Date.now();
+  try {
+    return await evaluateOnce(tabId, expression, aggressiveRetry, timeoutMs, startedAt);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    if (msg.includes("Detached") || msg.includes("Debugger is not attached") || msg.includes("Target closed")) {
-      attached.delete(tabId);
+    console.warn(`[opencli:eval] failed tab=${tabId} t+${Date.now() - startedAt}ms: ${msg}`);
+    const isDetach = msg.includes("Detached") || msg.includes("Debugger is not attached") || msg.includes("Target closed") || msg.includes("attach failed");
+    if (!isDetach) throw e;
+    attached.delete(tabId);
+    if (!aggressiveRetry || !isPreEvalAttachFailure(msg)) {
+      markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
+      throw e;
     }
-    throw e;
+    try {
+      return await evaluateViaFallbacks(tabId, expression, startedAt);
+    } catch (fallbackErr) {
+      const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      console.warn(`[opencli:eval] fallbacks exhausted tab=${tabId}: ${fallbackMsg}`);
+      markTabPoisoned(tabId, `eval:${msg.slice(0, 80)}`);
+      throw e;
+    }
   }
 }
 const evaluateAsync = evaluate;
@@ -326,66 +548,60 @@ async function waitForDownload(pattern = "", timeoutMs = 3e4) {
     });
   });
 }
-function frameTargetKey(tabId, frameId) {
-  return `${tabId}:${frameId}`;
-}
-function registerFrameTargetCleanup() {
-  if (frameTargetCleanupRegistered) return;
-  frameTargetCleanupRegistered = true;
-  chrome.debugger.onEvent.addListener((_source, method, params) => {
-    if (method === "Target.detachedFromTarget") {
-      const targetId = String(params?.targetId || "");
-      clearFrameTarget(targetId);
-    }
-  });
-}
-function clearFrameTarget(targetId) {
-  if (!targetId) return;
-  const key = frameTargetKeys.get(targetId);
-  if (key) frameTargets.delete(key);
-  frameTargetKeys.delete(targetId);
-}
-async function ensureFrameTarget(tabId, frameId, aggressiveRetry = false, targetUrl) {
-  registerFrameTargetCleanup();
-  await ensureAttached(tabId, aggressiveRetry);
-  const key = frameTargetKey(tabId, frameId);
-  const existing = frameTargets.get(key);
-  if (existing) return existing;
-  await sendDebuggerCommand({ tabId }, "Target.setDiscoverTargets", { discover: true }).catch(() => {
-  });
-  await sendDebuggerCommand({ tabId }, "Target.setAutoAttach", {
-    autoAttach: true,
-    waitForDebuggerOnStart: false,
-    flatten: true,
-    filter: [{ type: "iframe", exclude: false }]
-  }).catch(() => {
-  });
-  const targetId = await resolveFrameTargetId(tabId, frameId, targetUrl);
+async function ensureAutoAttach(tabId) {
+  if (autoAttachRequested.has(tabId)) return;
+  autoAttachRequested.add(tabId);
   try {
-    await chrome.debugger.attach({ targetId }, "1.3");
+    await sendDebuggerCommand({ tabId }, "Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+      filter: [{ type: "iframe", exclude: false }]
+    });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (!message.includes("Another debugger is already attached")) throw err;
+    autoAttachRequested.delete(tabId);
+    throw err;
   }
-  frameTargets.set(key, targetId);
-  frameTargetKeys.set(targetId, key);
-  return targetId;
 }
-async function resolveFrameTargetId(tabId, frameId, targetUrl) {
-  const result = await sendDebuggerCommand({ tabId }, "Target.getTargets").catch(() => null);
-  const targets = result?.targetInfos ?? [];
-  const frameTarget = targets.find((candidate) => {
-    const candidateId = candidate.targetId || candidate.id;
-    return candidate.type === "iframe" && (candidateId === frameId || !!targetUrl && candidate.url === targetUrl);
-  });
-  const targetId = frameTarget?.targetId || frameTarget?.id;
-  if (targetId) return targetId;
-  const candidates = targets.filter((target) => target.type === "iframe").map((target) => `${target.targetId || target.id || "?"} ${target.url || ""}`).join("; ");
-  throw new Error(`No iframe target found for frame ${frameId}${targetUrl ? ` (${targetUrl})` : ""}. Candidates: ${candidates || "none"}`);
+function getKnownFrameTargets(tabId) {
+  const sessions = frameSessions.get(tabId);
+  if (!sessions) return [];
+  return [...sessions.keys()].map((frameId) => ({ frameId, url: frameTargetUrls.get(frameId) ?? "" }));
 }
-async function sendCommandInFrameTarget(tabId, frameId, method, params = {}, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS, targetUrl) {
-  const targetId = await ensureFrameTarget(tabId, frameId, aggressiveRetry, targetUrl);
-  const target = { targetId };
+async function discoverFrameTargets(tabId, timeoutMs = 1500) {
+  await ensureAttached(tabId);
+  await ensureAutoAttach(tabId);
+  const deadline = Date.now() + timeoutMs;
+  let lastCount = -1;
+  let stableChecks = 0;
+  while (Date.now() < deadline) {
+    const count = frameSessions.get(tabId)?.size ?? 0;
+    if (count > 0 && count === lastCount) {
+      stableChecks += 1;
+      if (stableChecks >= 2) break;
+    } else {
+      stableChecks = 0;
+    }
+    lastCount = count;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return getKnownFrameTargets(tabId);
+}
+async function resolveFrameSessionId(tabId, frameId, timeoutMs) {
+  await ensureAutoAttach(tabId);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const sessionId = frameSessions.get(tabId)?.get(frameId);
+    if (sessionId) return sessionId;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const known = getKnownFrameTargets(tabId).map((t) => `${t.frameId} ${t.url}`).join("; ");
+  throw new Error(`No cross-origin frame target found for frame ${frameId}. Candidates: ${known || "none"}`);
+}
+async function sendCommandInFrameTarget(tabId, frameId, method, params = {}, aggressiveRetry = false, timeoutMs = CDP_COMMAND_TIMEOUT_MS, _targetUrl) {
+  await ensureAttached(tabId, aggressiveRetry);
+  const sessionId = await resolveFrameSessionId(tabId, frameId, timeoutMs);
+  const target = { tabId, sessionId };
   return sendDebuggerCommand(target, method, params, timeoutMs);
 }
 async function insertText(tabId, text) {
@@ -393,10 +609,46 @@ async function insertText(tabId, text) {
   await sendDebuggerCommand({ tabId }, "Input.insertText", { text });
 }
 function registerFrameTracking() {
-  registerFrameTargetCleanup();
   chrome.debugger.onEvent.addListener((source, method, params) => {
     const tabId = source.tabId;
     if (!tabId) return;
+    if (method === "Target.attachedToTarget") {
+      const info = params?.targetInfo;
+      const sessionId = params?.sessionId;
+      if (info?.type === "iframe" && info.targetId && sessionId) {
+        if (!frameSessions.has(tabId)) frameSessions.set(tabId, /* @__PURE__ */ new Map());
+        frameSessions.get(tabId).set(info.targetId, sessionId);
+        frameTargetUrls.set(info.targetId, info.url ?? "");
+        sendDebuggerCommand({ tabId, sessionId }, "Target.setAutoAttach", {
+          autoAttach: true,
+          waitForDebuggerOnStart: false,
+          flatten: true,
+          filter: [{ type: "iframe", exclude: false }]
+        }).catch(() => {
+        });
+      }
+      return;
+    }
+    if (method === "Target.targetInfoChanged") {
+      const info = params?.targetInfo;
+      if (info?.type === "iframe" && info.targetId) frameTargetUrls.set(info.targetId, info.url ?? "");
+      return;
+    }
+    if (method === "Target.detachedFromTarget") {
+      const sessionId = params?.sessionId;
+      const sessions = frameSessions.get(tabId);
+      if (sessions && sessionId) {
+        for (const [frameId, sid] of sessions) {
+          if (sid === sessionId) {
+            sessions.delete(frameId);
+            frameTargetUrls.delete(frameId);
+            break;
+          }
+        }
+      }
+      return;
+    }
+    if (source.sessionId) return;
     if (method === "Runtime.executionContextCreated") {
       const context = params.context;
       if (!context?.auxData?.frameId || context.auxData.isDefault !== true) return;
@@ -526,13 +778,10 @@ function hasActiveNetworkCapture(tabId) {
   return networkCaptures.has(tabId);
 }
 function clearFrameTargetsForTab(tabId) {
-  for (const [key, targetId] of [...frameTargets.entries()]) {
-    if (!key.startsWith(`${tabId}:`)) continue;
-    frameTargets.delete(key);
-    frameTargetKeys.delete(targetId);
-    chrome.debugger.detach({ targetId }).catch(() => {
-    });
-  }
+  const sessions = frameSessions.get(tabId);
+  if (sessions) for (const frameId of sessions.keys()) frameTargetUrls.delete(frameId);
+  frameSessions.delete(tabId);
+  autoAttachRequested.delete(tabId);
 }
 async function detach(tabId) {
   clearFrameTargetsForTab(tabId);
@@ -551,16 +800,23 @@ function registerListeners() {
     networkCaptures.delete(tabId);
     tabFrameContexts.delete(tabId);
     clearFrameTargetsForTab(tabId);
+    clearTabPoison(tabId);
   });
-  chrome.debugger.onDetach.addListener((source) => {
+  chrome.debugger.onDetach.addListener((source, reason) => {
+    console.warn(`[opencli:attach] onDetach tabId=${source.tabId ?? "n/a"} targetId=${source.targetId ?? "n/a"} reason=${reason ?? "unknown"}`);
     if (source.tabId) {
       attached.delete(source.tabId);
       networkCaptures.delete(source.tabId);
       tabFrameContexts.delete(source.tabId);
       clearFrameTargetsForTab(source.tabId);
+      if (reason === "canceled_by_user") {
+        markTabPoisoned(source.tabId, `onDetach:${reason}`);
+      }
+      void describeAttachTargets(source.tabId).then((targets) => {
+        console.warn(`[opencli:attach] post-detach targets tab=${source.tabId} ${targets}`);
+      });
       return;
     }
-    if (source.targetId) clearFrameTarget(source.targetId);
   });
   chrome.tabs.onUpdated.addListener(async (tabId, info) => {
     if (info.url && !isDebuggableUrl$1(info.url)) {
@@ -861,8 +1117,12 @@ function connect() {
 async function connectAttempt() {
   if (isDaemonSocketActive()) return;
   try {
-    const res = await fetch(DAEMON_PING_URL, { signal: AbortSignal.timeout(1e3) });
+    const res = await fetch(DAEMON_PING_URL, {
+      signal: AbortSignal.timeout(1e3),
+      credentials: "omit"
+    });
     if (!res.ok) {
+      console.warn(`[opencli] daemon ping failed: HTTP ${res.status}`);
       scheduleReconnect();
       return;
     }
@@ -1015,6 +1275,11 @@ function getSessionFromKey(key) {
   } catch {
     return key.slice(idx + 1);
   }
+}
+function shouldUseAggressiveAttach(leaseKey) {
+  if (getSurfaceFromKey(leaseKey) === "browser") return true;
+  const session = getSessionFromKey(leaseKey);
+  return session === "site:amazon" || session.startsWith("site:amazon:");
 }
 function getIdleTimeout(key) {
   const session = automationSessions.get(key);
@@ -1494,10 +1759,99 @@ async function findReusableOwnedContainerTab(windowId, ownedGroupId) {
 }
 function initialTabIsAvailable(tabId) {
   if (tabId === void 0) return false;
+  if (isTabPoisoned(tabId)) return false;
   for (const session of automationSessions.values()) {
     if (session.owned && session.preferredTabId === tabId) return false;
   }
   return true;
+}
+async function replacePoisonedOwnedTab(leaseKey, poisonedTabId, preferredUrl) {
+  return withLeaseMutation(() => replacePoisonedOwnedTabUnlocked(leaseKey, poisonedTabId, preferredUrl));
+}
+async function replacePoisonedOwnedTabUnlocked(leaseKey, poisonedTabId, preferredUrl) {
+  const session = automationSessions.get(leaseKey);
+  if (!session?.owned) {
+    throw new Error(`Cannot replace poisoned tab ${poisonedTabId}: lease is not owned`);
+  }
+  if (session.preferredTabId !== null && session.preferredTabId !== poisonedTabId && !isTabPoisoned(session.preferredTabId)) {
+    try {
+      const existing = await chrome.tabs.get(session.preferredTabId);
+      if (isDebuggableUrl(existing.url)) {
+        console.log(`[opencli:attach] poison replace skipped; lease already moved to tab=${session.preferredTabId}`);
+        return { tabId: session.preferredTabId, tab: existing };
+      }
+    } catch {
+    }
+  }
+  if (!isTabPoisoned(poisonedTabId) && session.preferredTabId === poisonedTabId) {
+    try {
+      const stillGood = await chrome.tabs.get(poisonedTabId);
+      if (isDebuggableUrl(stillGood.url)) {
+        return { tabId: poisonedTabId, tab: stillGood };
+      }
+    } catch {
+    }
+  }
+  let targetUrl = preferredUrl;
+  if (!targetUrl || !isSafeNavigationUrl(targetUrl)) {
+    try {
+      const old = await chrome.tabs.get(poisonedTabId);
+      if (old.url && isSafeNavigationUrl(old.url)) targetUrl = old.url;
+    } catch {
+    }
+  }
+  if (!targetUrl || !isSafeNavigationUrl(targetUrl)) targetUrl = BLANK_PAGE;
+  console.warn(`[opencli:attach] replacing poisoned tab=${poisonedTabId} lease=${leaseKey} url=${targetUrl}`);
+  const role = getOwnedWindowRole(leaseKey);
+  const tab = await chrome.tabs.create({ windowId: session.windowId, url: targetUrl, active: true });
+  const tabId = tab.id;
+  if (!tabId) throw new Error("Failed to create replacement tab after CDP poison");
+  const group = await ensureOwnedContainerGroup(role, session.windowId, [tabId]);
+  const sessionWindowId = group?.windowId ?? tab.windowId;
+  await new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    }, 15e3);
+    const listener = (id, info, tab2) => {
+      if (id !== tabId || info.status !== "complete") return;
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      console.log(`[opencli:attach] replacement first-complete tab=${tabId} url=${tab2.url ?? targetUrl}`);
+      resolve();
+    };
+    chrome.tabs.onUpdated.addListener(listener);
+    void chrome.tabs.get(tabId).then((tab2) => {
+      if (tab2.status === "complete") {
+        clearTimeout(timeout);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }).catch(() => {
+    });
+  });
+  setLeaseSession(leaseKey, {
+    session: session.session,
+    surface: session.surface,
+    kind: "owned",
+    windowId: sessionWindowId,
+    owned: true,
+    preferredTabId: tabId
+  });
+  resetWindowIdleTimer(leaseKey);
+  try {
+    await chrome.tabs.remove(poisonedTabId);
+  } catch {
+  }
+  const settled = await chrome.tabs.get(tabId);
+  try {
+    await ensureAttached(tabId, true);
+    console.log(`[opencli:attach] replacement pre-attached tab=${tabId}`);
+  } catch (err) {
+    console.warn(`[opencli:attach] replacement pre-attach failed tab=${tabId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  console.log(`[opencli:attach] replacement ready old=${poisonedTabId} new=${tabId} url=${settled.url ?? targetUrl}`);
+  return { tabId, tab: settled };
 }
 async function createOwnedTabLease(leaseKey, initialUrl) {
   return withLeaseMutation(() => createOwnedTabLeaseUnlocked(leaseKey, initialUrl));
@@ -1759,8 +2113,10 @@ function getUrlOrigin(url) {
     return null;
   }
 }
-function enumerateCrossOriginFrames(tree) {
+function enumerateCrossOriginFrames(tree, knownTargets = []) {
   const frames = [];
+  const targetUrlByFrameId = new Map(knownTargets.map((t) => [t.frameId, t.url]));
+  const seenFrameIds = /* @__PURE__ */ new Set();
   function collect(node, accessibleOrigin) {
     for (const child of node.childFrames || []) {
       const frame = child.frame;
@@ -1770,10 +2126,11 @@ function enumerateCrossOriginFrames(tree) {
         collect(child, frameOrigin);
         continue;
       }
+      seenFrameIds.add(frame.id);
       frames.push({
         index: frames.length,
         frameId: frame.id,
-        url: frameUrl,
+        url: targetUrlByFrameId.get(frame.id) || frameUrl,
         name: frame.name || ""
       });
     }
@@ -1781,6 +2138,10 @@ function enumerateCrossOriginFrames(tree) {
   const rootFrame = tree?.frameTree?.frame;
   const rootUrl = rootFrame?.url || rootFrame?.unreachableUrl || "";
   collect(tree.frameTree, getUrlOrigin(rootUrl));
+  for (const target of knownTargets) {
+    if (seenFrameIds.has(target.frameId)) continue;
+    frames.push({ index: frames.length, frameId: target.frameId, url: target.url, name: "" });
+  }
   return frames;
 }
 function setLeaseSession(leaseKey, session) {
@@ -1795,8 +2156,17 @@ function setLeaseSession(leaseKey, session) {
   void persistRuntimeState();
 }
 async function resolveCommandTabId(cmd) {
-  if (cmd.page) return resolveTabId$1(cmd.page);
-  return void 0;
+  if (!cmd.page) return void 0;
+  try {
+    return await resolveTabId$1(cmd.page);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("stale page identity") || msg.includes("Page not found:")) {
+      console.warn(`[opencli:attach] stale page identity ${cmd.page}; falling back to lease`);
+      return void 0;
+    }
+    throw err;
+  }
 }
 async function resolveTab(tabId, leaseKey, initialUrl) {
   const existingSession = automationSessions.get(leaseKey);
@@ -1805,7 +2175,12 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
       const tab = await chrome.tabs.get(tabId);
       const session = existingSession;
       const matchesSession = session ? session.preferredTabId !== null ? session.preferredTabId === tabId : tab.windowId === session.windowId : false;
-      if (isDebuggableUrl(tab.url) && matchesSession) return { tabId, tab };
+      if (isDebuggableUrl(tab.url) && matchesSession) {
+        if (session?.owned && isTabPoisoned(tabId)) {
+          return replacePoisonedOwnedTab(leaseKey, tabId, initialUrl ?? tab.url);
+        }
+        return { tabId, tab };
+      }
       if (session && !session.owned) {
         throw new CommandFailure(
           matchesSession ? "bound_tab_not_debuggable" : "bound_tab_mismatch",
@@ -1845,7 +2220,12 @@ async function resolveTab(tabId, leaseKey, initialUrl) {
     const session = existingSession;
     try {
       const preferredTab = await chrome.tabs.get(existingPreferredTabId);
-      if (isDebuggableUrl(preferredTab.url)) return { tabId: preferredTab.id, tab: preferredTab };
+      if (isDebuggableUrl(preferredTab.url)) {
+        if (session.owned && isTabPoisoned(existingPreferredTabId)) {
+          return replacePoisonedOwnedTab(leaseKey, existingPreferredTabId, initialUrl ?? preferredTab.url);
+        }
+        return { tabId: preferredTab.id, tab: preferredTab };
+      }
       if (!session.owned) {
         throw new CommandFailure(
           "bound_tab_not_debuggable",
@@ -1952,10 +2332,12 @@ async function handleExec(cmd, leaseKey) {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const aggressive = getSurfaceFromKey(leaseKey) === "browser";
+    const aggressive = shouldUseAggressiveAttach(leaseKey);
+    console.log(`[opencli:exec] start lease=${leaseKey} tab=${tabId} aggressive=${aggressive} frameIndex=${cmd.frameIndex ?? "main"} codeLen=${cmd.code.length}`);
     if (cmd.frameIndex != null) {
       const tree = await getFrameTree(tabId);
-      const frames = enumerateCrossOriginFrames(tree);
+      const knownTargets = await discoverFrameTargets(tabId);
+      const frames = enumerateCrossOriginFrames(tree, knownTargets);
       if (cmd.frameIndex < 0 || cmd.frameIndex >= frames.length) {
         return { id: cmd.id, ok: false, error: `Frame index ${cmd.frameIndex} out of range (${frames.length} cross-origin frames available)` };
       }
@@ -1973,10 +2355,23 @@ async function handleFrames(cmd, leaseKey) {
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
     const tree = await getFrameTree(tabId);
-    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree) };
+    const knownTargets = await discoverFrameTargets(tabId);
+    return { id: cmd.id, ok: true, data: enumerateCrossOriginFrames(tree, knownTargets) };
   } catch (err) {
     return errorResult(cmd.id, err);
   }
+}
+function preferOwnedTab(leaseKey, tabId) {
+  const session = automationSessions.get(leaseKey);
+  if (!session?.owned) return;
+  setLeaseSession(leaseKey, {
+    session: session.session,
+    surface: session.surface,
+    kind: session.kind,
+    windowId: session.windowId,
+    owned: true,
+    preferredTabId: tabId
+  });
 }
 async function handleNavigate(cmd, leaseKey) {
   if (!cmd.url) return { id: cmd.id, ok: false, error: "Missing url" };
@@ -1989,10 +2384,13 @@ async function handleNavigate(cmd, leaseKey) {
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
+  console.log(`[opencli:nav] start lease=${leaseKey} tab=${tabId} from=${beforeTab.url ?? "unknown"} to=${targetUrl} status=${beforeTab.status ?? "?"} capture=${hasActiveNetworkCapture(tabId)}`);
   if (beforeTab.status === "complete" && isTargetUrl(beforeTab.url, targetUrl)) {
+    console.log(`[opencli:nav] fast-path already-at-target tab=${tabId} url=${beforeTab.url}`);
     return pageScopedResult(cmd.id, tabId, { title: beforeTab.title, url: beforeTab.url, timedOut: false });
   }
   if (!hasActiveNetworkCapture(tabId)) {
+    console.log(`[opencli:nav] pre-nav detach tab=${tabId}`);
     await detach(tabId);
   }
   await chrome.tabs.update(tabId, { url: targetUrl });
@@ -2035,6 +2433,14 @@ async function handleNavigate(cmd, leaseKey) {
     }, 15e3);
   });
   let tab = await chrome.tabs.get(tabId);
+  console.log(`[opencli:nav] settled tab=${tabId} url=${tab.url ?? "unknown"} status=${tab.status ?? "?"} timedOut=${timedOut}`);
+  if (shouldUseAggressiveAttach(leaseKey) && !timedOut) {
+    console.log(`[opencli:nav] post-complete quiet wait tab=${tabId}`);
+    await waitForTabQuiet(tabId, 800, 8e3);
+    await stripForeignEmbedsViaContent(tabId);
+    tab = await chrome.tabs.get(tabId);
+    console.log(`[opencli:nav] post-quiet tab=${tabId} url=${tab.url ?? "unknown"} status=${tab.status ?? "?"}`);
+  }
   const postNavigationSession = automationSessions.get(leaseKey);
   if (postNavigationSession && tab.windowId !== postNavigationSession.windowId) {
     console.warn(`[opencli] Tab ${tabId} drifted to window ${tab.windowId} during navigation, moving back to ${postNavigationSession.windowId}`);
@@ -2112,6 +2518,34 @@ async function handleTabs(cmd, leaseKey) {
         }
         return { id: cmd.id, ok: true, data: { closed: closedPage2 } };
       }
+      if (cmd.page !== void 0 && session?.owned) {
+        let tabId2;
+        try {
+          tabId2 = await resolveCommandTabId(cmd);
+        } catch {
+          return { id: cmd.id, ok: false, error: `Page no longer exists` };
+        }
+        if (tabId2 === void 0) {
+          return { id: cmd.id, ok: false, error: `Page no longer exists` };
+        }
+        let tab;
+        try {
+          tab = await chrome.tabs.get(tabId2);
+        } catch {
+          return { id: cmd.id, ok: false, error: `Page no longer exists` };
+        }
+        if (tab.windowId !== session.windowId) {
+          return { id: cmd.id, ok: false, error: `Page is not in the automation container` };
+        }
+        const closedPage2 = await resolveTargetId(tabId2).catch(() => void 0);
+        if (session.preferredTabId === tabId2) {
+          await releaseLease(leaseKey, "tab close");
+        } else {
+          await safeDetach(tabId2);
+          await chrome.tabs.remove(tabId2);
+        }
+        return { id: cmd.id, ok: true, data: { closed: closedPage2 } };
+      }
       const cmdTabId = await resolveCommandTabId(cmd);
       const tabId = await resolveTabId(cmdTabId, leaseKey);
       const closedPage = await resolveTargetId(tabId).catch(() => void 0);
@@ -2140,12 +2574,14 @@ async function handleTabs(cmd, leaseKey) {
           return { id: cmd.id, ok: false, error: `Page is not in the automation container` };
         }
         await chrome.tabs.update(cmdTabId, { active: true });
+        preferOwnedTab(leaseKey, cmdTabId);
         return pageScopedResult(cmd.id, cmdTabId, { selected: true });
       }
       const tabs = await listAutomationWebTabs(leaseKey);
       const target = tabs[cmd.index];
       if (!target?.id) return { id: cmd.id, ok: false, error: `Tab index ${cmd.index} not found` };
       await chrome.tabs.update(target.id, { active: true });
+      preferOwnedTab(leaseKey, target.id);
       return pageScopedResult(cmd.id, target.id, { selected: true });
     }
     default:
@@ -2223,7 +2659,7 @@ async function handleCdp(cmd, leaseKey) {
   const cmdTabId = await resolveCommandTabId(cmd);
   const tabId = await resolveTabId(cmdTabId, leaseKey);
   try {
-    const aggressive = getSurfaceFromKey(leaseKey) === "browser";
+    const aggressive = shouldUseAggressiveAttach(leaseKey);
     await ensureAttached(tabId, aggressive);
     const params = cmd.cdpParams ?? {};
     const routeFrameId = typeof params.frameId === "string" && params.sessionId === "target" ? params.frameId : void 0;
