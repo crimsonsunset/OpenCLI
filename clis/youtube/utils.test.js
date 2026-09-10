@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { extractJsonAssignmentFromHtml, extractSubscriptionChannel, prepareYoutubeApiPage, readYoutubeSapisid } from './utils.js';
+import { extractJsonAssignmentFromHtml, extractPlaylistVideos, extractSubscriptionChannel, prepareYoutubeApiPage, readYoutubeSapisid } from './utils.js';
 describe('youtube utils', () => {
     it('extractJsonAssignmentFromHtml parses bootstrap objects with nested braces in strings', () => {
         const html = `
@@ -49,6 +49,56 @@ describe('youtube utils', () => {
             getCookies: vi.fn().mockResolvedValue([{ name: 'SAPISID', value: 'legacy' }]),
         };
         await expect(readYoutubeSapisid(page)).resolves.toBe('legacy');
+    });
+    it('extractPlaylistVideos reads classic playlistVideoRenderer rows', () => {
+        expect(extractPlaylistVideos([
+            {
+                playlistVideoRenderer: {
+                    videoId: 'abc',
+                    index: { simpleText: '2' },
+                    title: { runs: [{ text: 'Classic' }] },
+                    shortBylineText: { runs: [{ text: 'Chan' }] },
+                    lengthText: { simpleText: '1:23' },
+                    videoInfo: { runs: [{ text: '9 views' }, { text: '•' }, { text: '1 day ago' }] },
+                },
+            },
+            { continuationItemRenderer: {} },
+        ])).toEqual([{
+            rank: 2,
+            title: 'Classic',
+            channel: 'Chan',
+            duration: '1:23',
+            views: '9 views',
+            published: '1 day ago',
+            url: 'https://www.youtube.com/watch?v=abc',
+        }]);
+    });
+    it('extractPlaylistVideos reads Saved Shorts shortsLockupViewModel rows', () => {
+        expect(extractPlaylistVideos([{
+            richItemRenderer: {
+                content: {
+                    shortsLockupViewModel: {
+                        indexInCollection: 0,
+                        accessibilityText: 'Costco steak, 211 thousand views - play Short',
+                        overlayMetadata: { primaryText: { content: 'Costco steak' } },
+                        onTap: {
+                            innertubeCommand: {
+                                commandMetadata: { webCommandMetadata: { url: '/shorts/3NGX8Vhh66E' } },
+                                reelWatchEndpoint: { videoId: '3NGX8Vhh66E' },
+                            },
+                        },
+                    },
+                },
+            },
+        }])).toEqual([{
+            rank: 1,
+            title: 'Costco steak',
+            channel: '',
+            duration: '',
+            views: '211 thousand views',
+            published: '',
+            url: 'https://www.youtube.com/shorts/3NGX8Vhh66E',
+        }]);
     });
     it('extractSubscriptionChannel prefers explicit handle and subscriber count fields', () => {
         expect(extractSubscriptionChannel({

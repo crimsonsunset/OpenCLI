@@ -1,8 +1,10 @@
 /**
- * YouTube playlist — get playlist info and video list via InnerTube browse API.
+ * YouTube playlist — navigate to /playlist?list= and read ytInitialData.
+ * Homepage InnerTube browse (`VL` + id) returns no playlistVideoListRenderer
+ * and used to throw EMPTY_RESULT for every list, including public ones.
  */
 import { cli, Strategy } from '@jackwener/opencli/registry';
-import { prepareYoutubeApiPage, FETCH_BROWSE_FN, extractPlaylistVideos } from './utils.js';
+import { FETCH_BROWSE_FN, extractPlaylistVideos } from './utils.js';
 import { CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
 
 /**
@@ -35,40 +37,48 @@ cli({
     func: async (page, kwargs) => {
         const playlistId = parsePlaylistId(String(kwargs.id));
         const limit = Math.min(kwargs.limit || 50, 200);
-        await prepareYoutubeApiPage(page);
+        await page.goto(`https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}`);
+        await page.wait(3);
         const data = await page.evaluate(`
       (async () => {
+        const d = window.ytInitialData;
+        if (!d) return { error: 'YouTube data not found — are you logged in?' };
+
+        const limit = ${limit};
         const cfg = window.ytcfg?.data_ || {};
         const apiKey = cfg.INNERTUBE_API_KEY;
         const context = cfg.INNERTUBE_CONTEXT;
-        if (!apiKey || !context) return { error: 'YouTube config not found' };
 
-        const browseId = 'VL' + ${JSON.stringify(playlistId)};
-        const limit = ${limit};
+        const pageHeader = d.header?.pageHeaderRenderer;
+        const playlistHeader = d.header?.playlistHeaderRenderer;
+        const title = pageHeader?.pageTitle
+          || playlistHeader?.title?.simpleText
+          || '';
+        const metaRows = pageHeader?.content?.pageHeaderViewModel?.metadata?.contentMetadataViewModel?.metadataRows || [];
+        const stats = metaRows.length
+          ? metaRows.flatMap(r => (r.metadataParts || []).map(p => p.text?.content || '').filter(Boolean))
+          : (playlistHeader?.stats || [])
+            .map(s => s.runs?.map(r => r.text)?.join('') || s.simpleText || '')
+            .filter(Boolean);
 
-        ${FETCH_BROWSE_FN}
-
-        const data = await fetchBrowse(apiKey, { context, browseId });
-        if (data.error) return data;
-
-        const header = data.header?.pageHeaderRenderer;
-        const title = header?.pageTitle || '';
-        const metaRows = header?.content?.pageHeaderViewModel?.metadata?.contentMetadataViewModel?.metadataRows || [];
-        const stats = metaRows.flatMap(r => (r.metadataParts || []).map(p => p.text?.content || '').filter(Boolean));
-
-        const sidebarItems = data.sidebar?.playlistSidebarRenderer?.items || [];
+        const sidebarItems = d.sidebar?.playlistSidebarRenderer?.items || [];
         const secondaryInfo = sidebarItems.find(i => i.playlistSidebarSecondaryInfoRenderer)?.playlistSidebarSecondaryInfoRenderer;
         const channelName = secondaryInfo?.videoOwner?.videoOwnerRenderer?.title?.runs?.[0]?.text || '';
 
-        const tabs = data.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
-        let listContents = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]?.playlistVideoListRenderer?.contents || [];
+        const tabs = d.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
+        const itemSection = tabs[0]?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0] || {};
+        let listContents = itemSection.playlistVideoListRenderer?.contents
+          || itemSection.richGridRenderer?.contents
+          || [];
+
+        ${FETCH_BROWSE_FN}
 
         const extractVideos = ${extractPlaylistVideos.toString()};
 
         let videos = extractVideos(listContents);
 
         let contItem = listContents[listContents.length - 1];
-        while (videos.length < limit && contItem?.continuationItemRenderer) {
+        while (videos.length < limit && contItem?.continuationItemRenderer && apiKey && context) {
           const token = contItem.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
           if (!token) break;
           const contData = await fetchBrowse(apiKey, { context, continuation: token });
