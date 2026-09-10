@@ -107,24 +107,48 @@ async function fetchBrowse(apiKey, body) {
 }
 `;
 /**
- * Extract video objects from playlistVideoRenderer items (playlists, watch-later).
- * Pure function — inject into page.evaluate() via: extractPlaylistVideos.toString()
+ * Extract video objects from playlist page items.
+ * Classic lists use playlistVideoRenderer. Saved Shorts (`YS`) uses
+ * shortsLockupViewModel inside a richGrid. Pure function — inject via
+ * extractPlaylistVideos.toString().
  */
 export function extractPlaylistVideos(items) {
-    return items
-        .filter(i => i.playlistVideoRenderer)
-        .map(i => {
-        const v = i.playlistVideoRenderer;
-        const infoRuns = v.videoInfo?.runs || [];
-        return {
-            rank: parseInt(v.index?.simpleText || '0', 10),
-            title: v.title?.runs?.[0]?.text || '',
-            channel: v.shortBylineText?.runs?.[0]?.text || '',
-            duration: v.lengthText?.simpleText || '',
-            views: infoRuns[0]?.text || '',
-            published: infoRuns[2]?.text || '',
-            url: 'https://www.youtube.com/watch?v=' + v.videoId,
-        };
+    return items.flatMap((item) => {
+        if (item.playlistVideoRenderer) {
+            const v = item.playlistVideoRenderer;
+            const infoRuns = v.videoInfo?.runs || [];
+            return [{
+                rank: parseInt(v.index?.simpleText || '0', 10),
+                title: v.title?.runs?.[0]?.text || '',
+                channel: v.shortBylineText?.runs?.[0]?.text || '',
+                duration: v.lengthText?.simpleText || '',
+                views: infoRuns[0]?.text || '',
+                published: infoRuns[2]?.text || '',
+                url: 'https://www.youtube.com/watch?v=' + v.videoId,
+            }];
+        }
+        const short = item.richItemRenderer?.content?.shortsLockupViewModel
+            || item.shortsLockupViewModel;
+        if (short) {
+            const command = short.onTap?.innertubeCommand || {};
+            const videoId = command.reelWatchEndpoint?.videoId || '';
+            const path = command.commandMetadata?.webCommandMetadata?.url
+                || (videoId ? '/shorts/' + videoId : '');
+            if (!path)
+                return [];
+            const a11y = short.accessibilityText || '';
+            const viewsMatch = a11y.match(/,\s*([^,]+views)/i);
+            return [{
+                rank: (short.indexInCollection ?? 0) + 1,
+                title: short.overlayMetadata?.primaryText?.content || '',
+                channel: '',
+                duration: '',
+                views: viewsMatch?.[1] || '',
+                published: '',
+                url: path.startsWith('http') ? path : 'https://www.youtube.com' + path,
+            }];
+        }
+        return [];
     });
 }
 /**
