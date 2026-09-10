@@ -237,7 +237,47 @@ export function clearTabPoison(tabId: number): void {
 }
 
 /**
+ * Whether Chrome reports a page debugger already attached to this tab.
+ * True for our session, another extension, or a ghost attach after target_closed.
+ * @param tabId - Chrome tab id
+ */
+async function isPageDebuggerHeld(tabId: number): Promise<boolean> {
+  try {
+    const targets = await chrome.debugger.getTargets();
+    return targets.some((t) => t.tabId === tabId && t.type === 'page' && t.attached);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reclaim a debugger session Chrome still holds after a service-worker restart.
+ * getTargets.attached is true for any debugger; sendCommand succeeding means it is ours.
+ * Detach+reattach of a held session fails with a misleading chrome-extension:// error.
+ * @param tabId - Chrome tab id
+ * @returns true if this extension already owns a working debugger session
+ */
+async function adoptExistingDebuggerSession(tabId: number): Promise<boolean> {
+  if (!await isPageDebuggerHeld(tabId)) return false;
+  try {
+    await sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
+      expression: '1', returnByValue: true,
+    }, CDP_PROBE_TIMEOUT_MS);
+    attached.add(tabId);
+    poisonedTabs.delete(tabId);
+    console.log(`[opencli:attach] adopted existing session tab=${tabId}`);
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[opencli:attach] adopt failed tab=${tabId}: ${msg}`);
+    return false;
+  }
+}
+
+/**
  * Ensure chrome.debugger is attached to tabId, with optional aggressive retry.
+ * Adopts a session Chrome still holds after SW restart, and waits out mid-load
+ * ghost-attaches that Chrome reports as chrome-extension:// of a different extension.
  * @param tabId - Chrome tab id to attach
  * @param aggressiveRetry - Use 5×1500ms instead of 2×500ms
  */
@@ -272,6 +312,26 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
       console.warn(`[opencli:attach] health-check failed tab=${tabId}: ${probeMsg}`);
       attached.delete(tabId);
     }
+  }
+
+  if (await adoptExistingDebuggerSession(tabId)) {
+    return;
+  }
+
+  // Ghost attach / lost debugger race during navigation. Attach-while-loading is
+  // what Chrome rejects as "Cannot access a chrome-extension:// URL of different
+  // extension" even when foreignExtOnTabCount is 0 (OpenCLI #661).
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === 'loading' && await isPageDebuggerHeld(tabId)) {
+      console.warn(`[opencli:attach] page held while loading tab=${tabId}; waiting for quiet`);
+      await waitForTabQuiet(tabId, 400, 8_000);
+      if (await adoptExistingDebuggerSession(tabId)) {
+        return;
+      }
+    }
+  } catch {
+    // tab gone — retry loop will surface it
   }
 
   // Retry attach up to 3 times — other extensions (1Password, Playwright MCP Bridge)
@@ -314,19 +374,32 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
         await stripForeignEmbedsViaContent(tabId);
       }
       if (attempt < MAX_ATTACH_RETRIES) {
-        // Don't burn 5×1500ms on permanent ghost-attach; fail faster into content-bridge eval.
-        const delayMs = lastError.includes('chrome-extension://') && aggressiveRetry
-          ? 200
-          : RETRY_DELAY_MS;
-        const maxAttempts = lastError.includes('chrome-extension://') && aggressiveRetry
-          ? Math.min(MAX_ATTACH_RETRIES, 2)
-          : MAX_ATTACH_RETRIES;
-        if (attempt >= maxAttempts) {
-          console.warn(`[opencli:attach] giving up early for content-bridge fallback tab=${tabId}`);
-          break;
+        let tabStillLoading = false;
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          tabStillLoading = tab.status === 'loading';
+        } catch { /* tab gone */ }
+
+        // Mid-load chrome-extension:// is usually a transient ghost attach, not a
+        // permanent foreign embed — wait for settle instead of giving up early.
+        if (lastError.includes('chrome-extension://') && tabStillLoading) {
+          console.warn(`[opencli:attach] chrome-extension error while loading tab=${tabId}; waiting for quiet`);
+          await waitForTabQuiet(tabId, 400, 8_000);
+        } else {
+          // Don't burn 5×1500ms on permanent ghost-attach; fail faster into content-bridge eval.
+          const delayMs = lastError.includes('chrome-extension://') && aggressiveRetry
+            ? 200
+            : RETRY_DELAY_MS;
+          const maxAttempts = lastError.includes('chrome-extension://') && aggressiveRetry
+            ? Math.min(MAX_ATTACH_RETRIES, 2)
+            : MAX_ATTACH_RETRIES;
+          if (attempt >= maxAttempts) {
+            console.warn(`[opencli:attach] giving up early for content-bridge fallback tab=${tabId}`);
+            break;
+          }
+          console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${delayMs}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
         }
-        console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${delayMs}ms...`);
-        await new Promise(resolve => setTimeout(resolve, delayMs));
         // Re-verify tab URL before retrying (it may have changed)
         try {
           const tab = await chrome.tabs.get(tabId);
@@ -354,7 +427,11 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
       finalWindowId = String(tab.windowId);
     } catch { /* tab gone */ }
     const targets = await describeAttachTargets(tabId);
-    console.error(`[opencli:attach] FAILED tab=${tabId} url=${finalUrl} windowId=${finalWindowId} error=${lastError} targets=${targets}`);
+    const isKnownExtConflict = lastError.includes('chrome-extension://')
+      || lastError.includes('Another debugger is already attached');
+    // console.error lands in chrome://extensions Errors; this conflict is handled.
+    const logFail = isKnownExtConflict ? console.warn : console.error;
+    logFail(`[opencli:attach] FAILED tab=${tabId} url=${finalUrl} windowId=${finalWindowId} error=${lastError} targets=${targets}`);
     // Aggressive callers (Amazon) still have content-bridge eval fallback — don't
     // poison yet or resolveTab will replace the tab before that path runs.
     if (!aggressiveRetry && (lastError.includes('chrome-extension://') || lastError.includes('Another debugger is already attached'))) {

@@ -113,6 +113,31 @@ function isTabPoisoned(tabId) {
 function clearTabPoison(tabId) {
   poisonedTabs.delete(tabId);
 }
+async function isPageDebuggerHeld(tabId) {
+  try {
+    const targets = await chrome.debugger.getTargets();
+    return targets.some((t) => t.tabId === tabId && t.type === "page" && t.attached);
+  } catch {
+    return false;
+  }
+}
+async function adoptExistingDebuggerSession(tabId) {
+  if (!await isPageDebuggerHeld(tabId)) return false;
+  try {
+    await sendDebuggerCommand({ tabId }, "Runtime.evaluate", {
+      expression: "1",
+      returnByValue: true
+    }, CDP_PROBE_TIMEOUT_MS);
+    attached.add(tabId);
+    poisonedTabs.delete(tabId);
+    console.log(`[opencli:attach] adopted existing session tab=${tabId}`);
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[opencli:attach] adopt failed tab=${tabId}: ${msg}`);
+    return false;
+  }
+}
 async function ensureAttached(tabId, aggressiveRetry = false) {
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -140,6 +165,20 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
       attached.delete(tabId);
     }
   }
+  if (await adoptExistingDebuggerSession(tabId)) {
+    return;
+  }
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === "loading" && await isPageDebuggerHeld(tabId)) {
+      console.warn(`[opencli:attach] page held while loading tab=${tabId}; waiting for quiet`);
+      await waitForTabQuiet(tabId, 400, 8e3);
+      if (await adoptExistingDebuggerSession(tabId)) {
+        return;
+      }
+    }
+  } catch {
+  }
   const MAX_ATTACH_RETRIES = aggressiveRetry ? 5 : 2;
   const RETRY_DELAY_MS = aggressiveRetry ? 1500 : 500;
   let lastError = "";
@@ -165,14 +204,25 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
         await stripForeignEmbedsViaContent(tabId);
       }
       if (attempt < MAX_ATTACH_RETRIES) {
-        const delayMs = lastError.includes("chrome-extension://") && aggressiveRetry ? 200 : RETRY_DELAY_MS;
-        const maxAttempts = lastError.includes("chrome-extension://") && aggressiveRetry ? Math.min(MAX_ATTACH_RETRIES, 2) : MAX_ATTACH_RETRIES;
-        if (attempt >= maxAttempts) {
-          console.warn(`[opencli:attach] giving up early for content-bridge fallback tab=${tabId}`);
-          break;
+        let tabStillLoading = false;
+        try {
+          const tab = await chrome.tabs.get(tabId);
+          tabStillLoading = tab.status === "loading";
+        } catch {
         }
-        console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${delayMs}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (lastError.includes("chrome-extension://") && tabStillLoading) {
+          console.warn(`[opencli:attach] chrome-extension error while loading tab=${tabId}; waiting for quiet`);
+          await waitForTabQuiet(tabId, 400, 8e3);
+        } else {
+          const delayMs = lastError.includes("chrome-extension://") && aggressiveRetry ? 200 : RETRY_DELAY_MS;
+          const maxAttempts = lastError.includes("chrome-extension://") && aggressiveRetry ? Math.min(MAX_ATTACH_RETRIES, 2) : MAX_ATTACH_RETRIES;
+          if (attempt >= maxAttempts) {
+            console.warn(`[opencli:attach] giving up early for content-bridge fallback tab=${tabId}`);
+            break;
+          }
+          console.warn(`[opencli] attach attempt ${attempt}/${MAX_ATTACH_RETRIES} failed: ${lastError}, retrying in ${delayMs}ms...`);
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
         try {
           const tab = await chrome.tabs.get(tabId);
           if (!isDebuggableUrl$1(tab.url)) {
@@ -195,7 +245,9 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
     } catch {
     }
     const targets = await describeAttachTargets(tabId);
-    console.error(`[opencli:attach] FAILED tab=${tabId} url=${finalUrl} windowId=${finalWindowId} error=${lastError} targets=${targets}`);
+    const isKnownExtConflict = lastError.includes("chrome-extension://") || lastError.includes("Another debugger is already attached");
+    const logFail = isKnownExtConflict ? console.warn : console.error;
+    logFail(`[opencli:attach] FAILED tab=${tabId} url=${finalUrl} windowId=${finalWindowId} error=${lastError} targets=${targets}`);
     if (!aggressiveRetry && (lastError.includes("chrome-extension://") || lastError.includes("Another debugger is already attached"))) {
       markTabPoisoned(tabId, `attach-failed:${lastError.slice(0, 80)}`);
     }
