@@ -99,6 +99,12 @@ cli({
             throw new CommandExecutionError(String(data.error));
         }
         if (!data.videos?.length) {
+            // Empty lists (test, book) are valid. Don't throw EMPTY_RESULT
+            // or karakeep-sync treats them as a connector failure.
+            if (data.title) {
+                process.stderr.write(`${data.title}  [${data.channelName}]  0 videos\n`);
+                return [];
+            }
             throw new EmptyResultError('youtube playlist');
         }
         const statsStr = (data.stats || []).join(' | ');
