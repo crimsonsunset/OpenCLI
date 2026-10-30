@@ -310,6 +310,16 @@ describe('daemon-client', () => {
     expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
   });
 
+  it.each(['slot_wait_timeout', 'slot_conflict'])('treats %s as a terminal SessionBusyError', async (errorCode) => {
+    vi.mocked(fetch).mockResolvedValue({
+      status: 503,
+      json: () => Promise.resolve({ id: 'server', ok: false, errorCode, error: 'Slot admission rejected.' }),
+    } as Response);
+
+    await expect(sendCommand('slot-acquire', { site: 'xiaohongshu', runId: 'run_1_1_1', poolSize: 1 })).rejects.toBeInstanceOf(SessionBusyError);
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+  });
+
   it('sendCommand forwards OPENCLI_PROFILE as a hard contextId requirement', async () => {
     vi.stubEnv('OPENCLI_PROFILE', 'work');
     vi.spyOn(Date, 'now').mockReturnValue(1_763_000_000_000);
@@ -363,6 +373,45 @@ describe('daemon-client', () => {
 
     const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body)) as { windowMode?: string };
     expect(body.windowMode).toBe('background');
+  });
+
+  it('sendCommand forwards OPENCLI_BROWSER_IDLE_TIMEOUT (seconds) as idleTimeout', async () => {
+    vi.stubEnv('OPENCLI_BROWSER_IDLE_TIMEOUT', '300');
+    vi.mocked(fetch).mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
+    } as Response);
+
+    await sendCommand('exec', { code: '1 + 1' });
+
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body)) as { idleTimeout?: number };
+    expect(body.idleTimeout).toBe(300);
+  });
+
+  it('sendCommand uses explicit idleTimeout before OPENCLI_BROWSER_IDLE_TIMEOUT env fallback', async () => {
+    vi.stubEnv('OPENCLI_BROWSER_IDLE_TIMEOUT', '300');
+    vi.mocked(fetch).mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
+    } as Response);
+
+    await sendCommand('exec', { code: '1 + 1', idleTimeout: 45 });
+
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body)) as { idleTimeout?: number };
+    expect(body.idleTimeout).toBe(45);
+  });
+
+  it.each(['0', '-5', '1.5', 'abc', ''])('sendCommand ignores invalid OPENCLI_BROWSER_IDLE_TIMEOUT=%j', async (raw) => {
+    vi.stubEnv('OPENCLI_BROWSER_IDLE_TIMEOUT', raw);
+    vi.mocked(fetch).mockResolvedValue({
+      status: 200,
+      json: () => Promise.resolve({ id: 'server', ok: true, data: 'ok' }),
+    } as Response);
+
+    await sendCommand('exec', { code: '1 + 1' });
+
+    const body = JSON.parse(String(vi.mocked(fetch).mock.calls[0][1]?.body)) as { idleTimeout?: number };
+    expect(body.idleTimeout).toBeUndefined();
   });
 
   it('sendCommand retries executor-transient errors ONCE with a NEW id (re-execution is a new logical attempt)', async () => {
@@ -446,7 +495,7 @@ describe('daemon-client', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  function mockEnsureReady(extensionVersion?: string) {
+  function mockEnsureReady(extensionVersion?: string, extensionCompatRange: string | null = '>=1.7.0') {
     return vi.spyOn(daemonLifecycle, 'ensureBrowserBridgeReady').mockResolvedValue({
       state: 'ready',
       status: {
@@ -455,6 +504,7 @@ describe('daemon-client', () => {
         uptime: 1,
         extensionConnected: true,
         ...(extensionVersion && { extensionVersion }),
+        ...(extensionCompatRange && { extensionCompatRange }),
         pending: 0,
         memoryMB: 0,
         port: 19825,
@@ -540,6 +590,26 @@ describe('daemon-client', () => {
       name: 'BrowserCommandError',
       code: 'command_result_unknown',
     } satisfies Partial<BrowserCommandError>);
+
+    expect(ensureSpy).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('sendCommand does NOT resend a post-connect drop on the legacy extension version line', async () => {
+    const ensureSpy = mockEnsureReady('1.7.2', null);
+    const reset = new TypeError('fetch failed');
+    (reset as { cause?: unknown }).cause = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+    vi.mocked(fetch)
+      .mockRejectedValueOnce(reset)
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ id: 'server', ok: true, data: 'executed again' }),
+      } as Response);
+
+    await expect(sendCommand('navigate', { url: 'https://example.com' })).rejects.toMatchObject({
+      code: 'command_result_unknown',
+    });
 
     expect(ensureSpy).toHaveBeenCalledTimes(1);
     expect(fetch).toHaveBeenCalledTimes(1);

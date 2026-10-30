@@ -108,23 +108,44 @@ async function fetchBrowse(apiKey, body) {
 `;
 /**
  * Extract video objects from playlist page items.
- * Classic lists use playlistVideoRenderer. Saved Shorts (`YS`) uses
- * shortsLockupViewModel inside a richGrid. Pure function — inject via
- * extractPlaylistVideos.toString().
+ * Classic lists use playlistVideoRenderer, newer lists use lockupViewModel, and
+ * Saved Shorts (`YS`) uses shortsLockupViewModel inside a richGrid. Pure
+ * function — inject via extractPlaylistVideos.toString().
+ * @param items - Playlist contents or continuation items
+ * @param offset - Videos already collected, so continuation ranks keep counting
  */
-export function extractPlaylistVideos(items) {
+export function extractPlaylistVideos(items, offset = 0) {
+    let position = offset;
     return items.flatMap((item) => {
         if (item.playlistVideoRenderer) {
             const v = item.playlistVideoRenderer;
             const infoRuns = v.videoInfo?.runs || [];
+            position += 1;
             return [{
-                rank: parseInt(v.index?.simpleText || '0', 10),
+                rank: parseInt(v.index?.simpleText || String(position), 10),
                 title: v.title?.runs?.[0]?.text || '',
                 channel: v.shortBylineText?.runs?.[0]?.text || '',
                 duration: v.lengthText?.simpleText || '',
                 views: infoRuns[0]?.text || '',
                 published: infoRuns[2]?.text || '',
                 url: 'https://www.youtube.com/watch?v=' + v.videoId,
+            }];
+        }
+        const lockup = item.lockupViewModel;
+        if (lockup?.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO' && lockup.contentId) {
+            const metadata = lockup.metadata?.lockupMetadataViewModel;
+            const rows = metadata?.metadata?.contentMetadataViewModel?.metadataRows || [];
+            const badges = (lockup.contentImage?.thumbnailViewModel?.overlays || [])
+                .flatMap(overlay => overlay.thumbnailBottomOverlayViewModel?.badges || []);
+            position += 1;
+            return [{
+                rank: position,
+                title: metadata?.title?.content || '',
+                channel: rows[0]?.metadataParts?.[0]?.text?.content || '',
+                duration: badges.find(badge => badge.thumbnailBadgeViewModel?.text)?.thumbnailBadgeViewModel.text || '',
+                views: rows[1]?.metadataParts?.[0]?.text?.content || '',
+                published: rows[1]?.metadataParts?.[1]?.text?.content || '',
+                url: 'https://www.youtube.com/watch?v=' + lockup.contentId,
             }];
         }
         const short = item.richItemRenderer?.content?.shortsLockupViewModel
@@ -138,8 +159,9 @@ export function extractPlaylistVideos(items) {
                 return [];
             const a11y = short.accessibilityText || '';
             const viewsMatch = a11y.match(/,\s*([^,]+views)/i);
+            position += 1;
             return [{
-                rank: (short.indexInCollection ?? 0) + 1,
+                rank: (short.indexInCollection ?? position - 1) + 1,
                 title: short.overlayMetadata?.primaryText?.content || '',
                 channel: '',
                 duration: '',
@@ -241,4 +263,31 @@ export async function readYoutubeSapisid(page) {
     || cookies.find((c) => c.name === 'SAPISID')?.value
     || null
   );
+}
+
+/**
+ * Depth-first search for the first value stored under `key` anywhere inside a
+ * nested InnerTube payload (objects and arrays). Returns `undefined` when the
+ * key is absent. YouTube renames renderer wrappers often, so callers look for
+ * the leaf key instead of hard-coding the full path.
+ *
+ * Pure — safe to inject into page.evaluate() via `findKeyDeep.toString()`.
+ */
+export function findKeyDeep(value, key) {
+    const stack = [value];
+    while (stack.length) {
+        const current = stack.pop();
+        if (!current || typeof current !== 'object') continue;
+        if (!Array.isArray(current) && Object.prototype.hasOwnProperty.call(current, key)) {
+            return current[key];
+        }
+        const children = Array.isArray(current) ? current : Object.values(current);
+        for (let i = children.length - 1; i >= 0; i -= 1) stack.push(children[i]);
+    }
+    return undefined;
+}
+
+/** True when `id` has the shape of a YouTube video id (11 URL-safe chars). */
+export function isYoutubeVideoId(id) {
+    return typeof id === 'string' && /^[A-Za-z0-9_-]{11}$/.test(id);
 }

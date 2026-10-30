@@ -1,6 +1,6 @@
 # 扩展 OpenCLI
 
-OpenCLI 有五类扩展路径。按源码放在哪里、命令要如何共享来选。
+OpenCLI 有四类扩展路径。按源码放在哪里、命令要如何共享来选。
 
 | 目标 | 使用方式 | 源码位置 | 命令入口 |
 |------|----------|----------|----------|
@@ -8,7 +8,6 @@ OpenCLI 有五类扩展路径。按源码放在哪里、命令要如何共享来
 | 快速写一个只在本机用的 adapter | User adapter | `~/.opencli/clis/<site>/<command>.js` | `opencli <site> <command>` |
 | 本地修改官方 adapter | Adapter override | `~/.opencli/clis/<site>/` | `opencli <site> <command>` |
 | 发布或安装第三方命令 | Plugin | Git repo，安装到 `~/.opencli/plugins/` | `opencli <plugin> <command>` |
-| 包装已有本机 binary | External CLI | `~/.opencli/external-clis.yaml` | `opencli <tool> ...` |
 
 ## 把个人命令放在自己的 Git repo
 
@@ -31,9 +30,9 @@ opencli my-cnn hello
 如果你只想快速生成一个本机 adapter，不需要单独项目目录，可以用 user adapter。
 
 ```bash
-opencli browser init cnn/top
+opencli adapter init cnn/top
 # edit ~/.opencli/clis/cnn/top.js
-opencli browser verify cnn/top
+opencli adapter test cnn/top
 opencli cnn top
 ```
 
@@ -48,11 +47,11 @@ User adapter 加载路径是：
 如果命令有 required positional args，而且 fixture 还没创建，第一次 verify 时直接传 seed：
 
 ```bash
-opencli browser verify instagram/collection-create --write-fixture --seed-args opencli-verify
-opencli browser verify example/detail --write-fixture --seed-args '["https://example.com/item/1", "--limit", 3]'
+opencli adapter test instagram/collection-create --write-fixture --args opencli-verify
+opencli adapter test example/detail --write-fixture --args '["https://example.com/item/1", "--limit", 3]'
 ```
 
-`--seed-args` 只在 fixture 没有 `args` 时生效。fixture 写出后，`opencli browser verify` 会从 `~/.opencli/sites/<site>/verify/<command>.json` 读取 args。
+`--args` 只在 fixture 没有 `args` 时生效。fixture 写出后，`opencli adapter test` 会从 `~/.opencli/sites/<site>/verify/<command>.json` 读取 args。
 
 `browser verify` 也会先检查 row shape：每行保持紧凑（顶层 key 不超过 12 个）、嵌套深度不超过 1，并且 `id` / `user_id` 这类 id-shaped 字段必须在顶层。
 
@@ -66,7 +65,7 @@ opencli adapter eject twitter
 opencli adapter reset twitter
 ```
 
-`~/.opencli/clis/<site>/<command>.js` 会在本机覆盖同名 package adapter。`opencli browser verify <site>/<command>` 也会跑本地覆盖版本，所以本地 verify 通过不代表 package 里的 adapter 已经改好。
+`~/.opencli/clis/<site>/<command>.js` 会在本机覆盖同名 package adapter。`opencli adapter test <site>/<command>` 也会跑本地覆盖版本，所以本地 verify 通过不代表 package 里的 adapter 已经改好。
 
 Package 里的 `cli-manifest.json` 只描述 bundled adapter。User adapter 是运行时发现的，不需要写 manifest。
 
@@ -115,18 +114,3 @@ opencli plugin install file:///absolute/path/opencli-plugins/packages/reuters
 ```
 
 本地 `file://` 安装要求目标目录本身就是一个有效 plugin，并且目录内有命令文件。monorepo root 请推到 GitHub 后走 GitHub monorepo 安装流程。
-
-## External CLI passthrough
-
-如果命令已经是本机 binary，只想统一挂到 `opencli` 下，用 external CLI registration。
-
-```bash
-opencli external register my-tool \
-  --binary my-tool \
-  --install "npm i -g my-tool" \
-  --desc "My internal CLI"
-
-opencli my-tool --help
-```
-
-External CLI 会把 stdio 和 exit code 透传给底层 binary。
