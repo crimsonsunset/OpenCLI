@@ -30,6 +30,7 @@ const CDP_REQUEST_BODY_CAPTURE_LIMIT = 1 * 1024 * 1024;
 
 type NetworkCaptureEntry = {
   kind: 'cdp';
+  requestId: string;
   url: string;
   method: string;
   requestHeaders?: Record<string, string>;
@@ -43,6 +44,9 @@ type NetworkCaptureEntry = {
   responsePreview?: string;
   responseBodyFullSize?: number;
   responseBodyTruncated?: boolean;
+  captureComplete?: boolean;
+  requestBodyPending?: boolean;
+  responseFinished?: boolean;
   timestamp: number;
 };
 
@@ -785,9 +789,11 @@ export async function setFileInputFiles(
       };
       chrome.debugger.onEvent.addListener(listener);
       // Open the chooser programmatically — interception suppresses the native
-      // dialog and fires Page.fileChooserOpened instead. Works for hidden inputs.
+      // dialog and fires Page.fileChooserOpened instead. Chrome requires user
+      // activation even for visible inputs; hidden inputs need no style changes.
       void sendDebuggerCommand({ tabId }, 'Runtime.evaluate', {
         expression: `document.querySelector(${JSON.stringify(query)}).click()`,
+        userGesture: true,
       }).catch((err) => {
         cleanup();
         reject(err instanceof Error ? err : new Error(String(err)));
@@ -1196,6 +1202,7 @@ function getOrCreateNetworkCaptureEntry(tabId: number, requestId: string, fallba
   if (!shouldCaptureUrl(url, state.patterns)) return null;
   const entry: NetworkCaptureEntry = {
     kind: 'cdp',
+    requestId,
     url,
     method: fallback?.method || 'GET',
     requestHeaders: fallback?.requestHeaders || {},
@@ -1219,12 +1226,29 @@ export async function startNetworkCapture(
   });
 }
 
-export async function readNetworkCapture(tabId: number): Promise<NetworkCaptureEntry[]> {
+export async function readNetworkCapture(tabId: number, retainIncomplete = false): Promise<NetworkCaptureEntry[]> {
   const state = networkCaptures.get(tabId);
   if (!state) return [];
-  const entries = state.entries.slice();
-  state.entries = [];
-  state.requestToIndex.clear();
+  // A request can be visible in the page before CDP finishes fetching its
+  // response body. Return a snapshot, but retain unfinished entries so a
+  // later read can observe the completed response instead of losing it.
+  const entries = state.entries.map(entry => ({ ...entry }));
+  if (!retainIncomplete) {
+    state.entries = [];
+    state.requestToIndex.clear();
+    return entries;
+  }
+  const pendingEntries: NetworkCaptureEntry[] = [];
+  const pendingMap = new Map<string, number>();
+  for (const [requestId, index] of state.requestToIndex) {
+    const entry = state.entries[index];
+    if (entry && !entry.captureComplete) {
+      pendingMap.set(requestId, pendingEntries.length);
+      pendingEntries.push(entry);
+    }
+  }
+  state.entries = pendingEntries;
+  state.requestToIndex = pendingMap;
   return entries;
 }
 
@@ -1318,6 +1342,7 @@ export function registerListeners(): void {
           entry.requestBodyFullSize = fullSize;
           entry.requestBodyTruncated = truncated;
         }
+        entry.requestBodyPending = true;
         try {
           const postData = await sendDebuggerCommand({ tabId }, 'Network.getRequestPostData', { requestId }) as { postData?: string };
           if (postData?.postData) {
@@ -1331,6 +1356,9 @@ export function registerListeners(): void {
           }
         } catch {
           // Optional; some requests do not expose postData.
+        } finally {
+          entry.requestBodyPending = false;
+          if (entry.responseFinished) entry.captureComplete = true;
         }
       }
       return;
@@ -1380,6 +1408,21 @@ export function registerListeners(): void {
         }
       } catch {
         // Optional; bodies are unavailable for some requests (e.g. uploads).
+      } finally {
+        entry.responseFinished = true;
+        if (!entry.requestBodyPending) entry.captureComplete = true;
+      }
+      return;
+    }
+
+    if (method === 'Network.loadingFailed') {
+      const requestId = String(eventParams?.requestId || '');
+      const stateEntryIndex = state.requestToIndex.get(requestId);
+      if (stateEntryIndex === undefined) return;
+      const entry = state.entries[stateEntryIndex];
+      if (entry) {
+        entry.responseFinished = true;
+        if (!entry.requestBodyPending) entry.captureComplete = true;
       }
     }
   });

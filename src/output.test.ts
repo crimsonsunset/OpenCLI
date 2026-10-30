@@ -14,13 +14,25 @@ describe('output TTY detection', () => {
     logSpy.mockRestore();
   });
 
-  it('outputs YAML in non-TTY when format is default table', () => {
+  it('rejects unsupported render formats even for empty output', () => {
+    expect(() => render(null, { fmt: 'bogus' })).toThrow('--format must be one of');
+    expect(logSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([['yml', 'yaml'], ['markdown', 'md']])('preserves the %s alias', (alias, canonical) => {
+    render([{ value: 'hello' }], { fmt: alias });
+    const aliasOutput = logSpy.mock.calls.map((call: unknown[]) => call[0]);
+    logSpy.mockClear();
+    render([{ value: 'hello' }], { fmt: canonical });
+    expect(logSpy.mock.calls.map((call: unknown[]) => call[0])).toEqual(aliasOutput);
+  });
+
+  it('defaults to a JSON envelope in non-TTY', () => {
     Object.defineProperty(process.stdout, 'isTTY', { value: false, writable: true });
     // commanderAdapter always passes fmt:'table' as default — this must still trigger downgrade
-    render([{ name: 'alice', score: 10 }], { fmt: 'table', columns: ['name', 'score'] });
+    render([{ name: 'alice', score: 10 }], { columns: ['name', 'score'] });
     const out = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
-    expect(out).toContain('name: alice');
-    expect(out).toContain('score: 10');
+    expect(JSON.parse(out)).toEqual({ok:true,data:[{name:'alice',score:10}]});
   });
 
   it('outputs table in TTY when format is default table', () => {
@@ -34,7 +46,7 @@ describe('output TTY detection', () => {
     Object.defineProperty(process.stdout, 'isTTY', { value: false, writable: true });
     render([{ name: 'alice', note: 'line 1\nline 2' }], { fmt: 'json' });
     const out = logSpy.mock.calls.map((c: unknown[]) => c[0]).join('\n');
-    expect(JSON.parse(out)).toEqual([{ name: 'alice', note: 'line 1\nline 2' }]);
+    expect(JSON.parse(out)).toEqual({ok:true,data:[{ name: 'alice', note: 'line 1\nline 2' }]});
   });
 
   it('shows elapsed time when elapsed is 0', () => {

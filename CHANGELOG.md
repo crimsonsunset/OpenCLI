@@ -1,5 +1,61 @@
 # Changelog
 
+## [2.0.2](https://github.com/jackwener/opencli/compare/v2.0.1...v2.0.2) (2026-10-20)
+
+### Fixes
+
+- Publish through npm Trusted Publishing (GitHub Actions OIDC), with provenance required by default (#2622).
+- Verify the published tarball, provenance source identity, signatures, and a clean mise installation before announcing a release. Release retries also verify any existing version instead of silently accepting it.
+- Keep Chrome extension **1.0.26** unchanged; this release repairs npm publishing evidence. Earlier package versions are immutable and do not gain provenance retroactively.
+
+## [2.0.1](https://github.com/jackwener/opencli/compare/v2.0.0...v2.0.1) (2026-10-20)
+
+Includes Chrome extension **1.0.26**. Update the extension to receive the navigation fix.
+
+### Features
+
+- Add a validated Douyin single-content detail reader (#2667).
+
+### Fixes
+
+- Avoid duplicate browser navigations during extension tab lease creation, which can cause Chromium's `Navigation rejected.` error without `--trace` (#2487, #2679).
+- Reject native input on hidden pages without replaying the action (#2664).
+- Wait for complete Ctrip flight captures in the foreground (#2663).
+- Capture page-owned TikTok profile responses and the current identity (#2662).
+- Locate LinkedIn activity cards from post permalinks (#2661).
+- Bound Xiaohongshu lazy user pagination while retaining collected results (#2666).
+- Classify Xueqiu page failures and expose response shape (#2668).
+- Classify Instagram read failures and navigate target profiles (#2669).
+
+## [2.0.0](https://github.com/jackwener/opencli/compare/v1.8.8...v2.0.0) (2026-10-17)
+
+A major release focused on agent experience: a smaller CLI surface, predictable JSON results, native Chrome APIs, and evidence-driven adapter development. Includes Chrome extension **1.0.25**.
+
+### Breaking changes and migration
+
+- Browser sessions are explicit options: use `opencli browser <command> ... --session research` instead of positional session names.
+- CLI results default to `{ "ok": true, "data": ... }`; failures use `{ "ok": false, "error": { "code", "message", "hint", ... } }` and a nonzero exit status. Update consumers to read `data`; follow modes emit JSON Lines. Explicit human-readable formats and raw exports remain available.
+- Use `opencli adapter init`, `adapter test`, and `adapter check` for adapter authoring and validation. These replace the former browser init/verify and adapter validation entry points.
+- Use `opencli browser network --static` for captured requests plus AST-derived endpoint evidence, and `opencli browser state --diagnostics` for page diagnostics. The separate discover/analyze workflow is removed.
+- Electron desktop automation, its app registry and public launcher export, site sitemap knowledge, and external CLI Hub passthrough are removed. Direct CDP connections to Chrome remain supported.
+- Existing JS adapter registration and execution contracts (`cli({...})`, `func(args)`, `func(page, args)`) remain supported. Adapter `defaultFormat` no longer overrides the CLI's JSON default.
+
+### Features
+
+- Native Chrome API discovery and calls through `opencli browser chrome describe` and `chrome call`, including tab/window management and tab-group creation and editing without attaching a page session. Managed session resources are protected.
+- Compact, paginated command discovery with `opencli list [query] --site --limit --offset`; streamlined bundled agent skills and adapter authoring.
+- AST-based static endpoint discovery integrated with captured network evidence, with incomplete network captures retained when requested.
+- Per-site slot pools give concurrent adapter runs exclusive tabs and run-level pacing; optional owned-tab cleanup and configurable browser idle timeout.
+- Proton API inbox and verified browser authentication; Xiaohongshu comment/comment-delete and YouTube comment commands; richer Twitter, YouTube, and Bilibili metadata.
+
+### Fixes
+
+- Exclude Chrome 155 browser toolbar targets from direct CDP page selection so blank tabs remain usable.
+- More reliable ChatGPT file/image uploads and composer targeting; current Gemini, Grok, and DeepSeek composer flows.
+- Xiaohongshu captcha/search/comment handling, Taobao cart confirmation and blocked-page detection, DBLP browser-backed XML reads, and YouTube channel-handle resolution.
+- Plugin path containment and host-package linking, browser upload file chooser activation, auth recovery hints, and structured error/exit-code handling.
+- Updated Vitest to address GHSA-82fw-gwwq-j7x9.
+
 ## [1.8.4](https://github.com/jackwener/opencli/compare/v1.8.3...v1.8.4) (2026-06-15)
 
 Patch release surfacing the bundled skills directory, expanding the auth subsystem across 50+ adapters, refactoring the extension's tab-group model, and adding ten or so new adapter capabilities.
