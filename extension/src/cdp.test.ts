@@ -803,4 +803,42 @@ describe('eval fallbacks after attach failure', () => {
     expect(threw.execute).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
+
+  it('does not replay MAIN when expression writes then throws EvalError', async () => {
+    vi.useFakeTimers();
+    const { chrome } = createChromeMock();
+    chrome.tabs.get = vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://www.ticketmaster.com/', status: 'complete' }));
+    chrome.debugger.attach = vi.fn(async () => {
+      throw new Error('Cannot access a chrome-extension:// URL of different extension');
+    });
+    const execute = vi.fn(async () => [{ result: 'from-user-script' }]);
+    const executeScript = vi.fn(async (opts: {
+      world?: string;
+      func?: (...args: unknown[]) => unknown;
+      args?: unknown[];
+    }) => {
+      if (opts.world === 'MAIN' && typeof opts.func === 'function') {
+        return [{ result: await opts.func(...(opts.args ?? [])) }];
+      }
+      return [{ result: { removed: 0 } }];
+    });
+    vi.stubGlobal('chrome', {
+      ...chrome,
+      scripting: { executeScript },
+      tabs: { ...chrome.tabs, sendMessage: vi.fn(async () => ({ removed: 0 })) },
+      userScripts: { execute },
+    });
+
+    const mod = await import('./cdp');
+    const expression = 'globalThis.__opencliWrites = (globalThis.__opencliWrites || 0) + 1; throw new EvalError("boom")';
+    const pending = mod.evaluate(1, expression, true);
+    // evaluate resurfaces the original attach failure once fallbacks stop.
+    const assertion = expect(pending).rejects.toThrow(/attach failed/);
+    await vi.runAllTimersAsync();
+    await assertion;
+    expect((globalThis as { __opencliWrites?: number }).__opencliWrites).toBe(1);
+    expect(execute).not.toHaveBeenCalled();
+    delete (globalThis as { __opencliWrites?: number }).__opencliWrites;
+    vi.useRealTimers();
+  });
 });

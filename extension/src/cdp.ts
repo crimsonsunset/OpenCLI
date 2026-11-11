@@ -561,16 +561,28 @@ async function evaluateViaScriptingWorld(
     world,
     args: [expression],
     func: async (code: string) => {
+      // Compile a thunk first so page CSP (eval blocked) is distinguishable from
+      // an expression that runs, writes, then `throw new EvalError(...)`.
+      let run: () => unknown;
       try {
         // eslint-disable-next-line no-eval
-        const value = await (0, eval)(code);
+        run = (0, eval)(`(() => (0, eval)(${JSON.stringify(code)}))`) as () => unknown;
+      } catch (err) {
+        return {
+          __opencli: true,
+          ok: false as const,
+          isBlocked: true,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      try {
+        const value = await run();
         return { __opencli: true, ok: true as const, value };
       } catch (err) {
         return {
           __opencli: true,
           ok: false as const,
-          // CSP-blocked eval throws EvalError before any of the code runs.
-          isBlocked: err instanceof EvalError,
+          isBlocked: false,
           error: err instanceof Error ? err.message : String(err),
         };
       }

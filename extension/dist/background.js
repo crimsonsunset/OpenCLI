@@ -502,17 +502,28 @@ async function evaluateViaScriptingWorld(tabId, expression, world) {
 		world,
 		args: [expression],
 		func: async (code) => {
+			let run;
+			try {
+				run = (0, eval)(`(() => (0, eval)(${JSON.stringify(code)}))`);
+			} catch (err) {
+				return {
+					__opencli: true,
+					ok: false,
+					isBlocked: true,
+					error: err instanceof Error ? err.message : String(err)
+				};
+			}
 			try {
 				return {
 					__opencli: true,
 					ok: true,
-					value: await (0, eval)(code)
+					value: await run()
 				};
 			} catch (err) {
 				return {
 					__opencli: true,
 					ok: false,
-					isBlocked: err instanceof EvalError,
+					isBlocked: false,
 					error: err instanceof Error ? err.message : String(err)
 				};
 			}
