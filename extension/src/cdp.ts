@@ -517,10 +517,38 @@ async function evaluateViaUserScripts(
   });
   const injection = results?.[0];
   if (injection?.error) {
-    throw new Error(String(injection.error));
+    // Code reached the page world — may have written before throwing.
+    throwExecutionStarted(String(injection.error));
   }
   console.log(`[opencli:eval] userScripts fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
   return injection?.result;
+}
+
+/**
+ * chrome.scripting path with explicit ok/error envelope so CSP-blocked eval
+ * cannot silently return null (which crashed amazon readPageState on .href).
+ * @param tabId - Chrome tab id
+ * @param expression - JS source
+ * @param world - Execution world
+ */
+/**
+ * Throw an error flagged so fallbacks do not replay the expression.
+ * @param message - Underlying eval / injection error
+ */
+function throwExecutionStarted(message: string): never {
+  const err = new Error(message) as Error & { executionStarted: true };
+  err.executionStarted = true;
+  throw err;
+}
+
+/**
+ * Whether a fallback error means the expression may already have run.
+ * @param err - Error from a scripting / userScripts world
+ */
+function hasEvalExecutionStarted(err: unknown): boolean {
+  return typeof err === 'object'
+    && err !== null
+    && (err as { executionStarted?: boolean }).executionStarted === true;
 }
 
 /**
@@ -560,7 +588,7 @@ async function evaluateViaScriptingWorld(
     throw new Error('scripting fallback returned no result (likely CSP-blocked eval)');
   }
   if (!wrapped.ok) {
-    throw new Error(wrapped.error || 'scripting fallback eval failed');
+    throwExecutionStarted(wrapped.error || 'scripting fallback eval failed');
   }
   return wrapped.value;
 }
@@ -580,6 +608,7 @@ function isPreEvalAttachFailure(message: string): boolean {
  * Evaluate via scripting MAIN → userScripts → scripting ISOLATED.
  * MAIN matches Runtime.evaluate's page world when CSP allows; USER_SCRIPT is
  * the MV3-legal arbitrary-code path for Amazon /dp; ISOLATED is last resort.
+ * Never replay across worlds once a world may have started the expression.
  * @param tabId - Chrome tab id
  * @param expression - JS source CDP would have received
  * @param startedAt - Outer evaluate start time for log offsets
@@ -600,6 +629,8 @@ async function evaluateViaFallbacks(
     } catch (scriptErr) {
       const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
       console.warn(`[opencli:eval] scripting MAIN fallback failed tab=${tabId}: ${scriptMsg}`);
+      // Expression may have written then thrown — do not replay in userScripts.
+      if (hasEvalExecutionStarted(scriptErr)) throw scriptErr;
     }
   }
 
@@ -608,6 +639,7 @@ async function evaluateViaFallbacks(
   } catch (userScriptErr) {
     const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
     console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+    if (hasEvalExecutionStarted(userScriptErr)) throw userScriptErr;
   }
 
   if (hasScripting) {
