@@ -3165,6 +3165,34 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(browserKey('borrowed'))).not.toBeNull();
   });
 
+  it('does not remove an owned tab from a mixed window while a bound command is using it', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://session.example', active: true, status: 'complete', groupId: 400 });
+    tabs.push({ id: 71, windowId: 7, url: 'https://mine.example', active: false, status: 'complete' });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      [REGISTRY_KEY]: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: { interactive: { windowId: 7, groupIds: [400] }, automation: { windowId: null } },
+        leases: {},
+      },
+    });
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('work'), { windowId: 7, owned: true, preferredTabId: 70 });
+    mod.__test__.setSession(browserKey('borrowed'), { windowId: 7, owned: false, preferredTabId: 70 });
+    mod.__test__.setActiveCommandCount(browserKey('borrowed'), 1);
+
+    const result = await mod.__test__.handleCommand({ id: 'close-mixed-shared', action: 'close-owned-windows' });
+
+    expect((result.data as any).kept).toEqual(
+      expect.arrayContaining([{ role: 'interactive', windowId: 7, reason: 'busy' }]),
+    );
+    expect(tabs.some((tab) => tab.id === 70)).toBe(true);
+  });
+
   it('keeps the lease of a browser-session tab whose group moved before its old window closed', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({ id: 70, windowId: 7, url: 'https://session.example', title: 'session', active: true, status: 'complete', groupId: 400 });

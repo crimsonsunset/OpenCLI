@@ -1349,6 +1349,8 @@ async function forgetClosedWindow(windowId: number): Promise<void> {
     const liveTab = session.preferredTabId === null
       ? null
       : await chrome.tabs.get(session.preferredTabId).catch(() => null);
+    // A bind may have replaced this lease while the lookup was in flight.
+    if (automationSessions.get(leaseKey) !== session) continue;
     const liveWindowId = liveTab?.windowId ?? session.windowId;
     if (liveWindowId !== windowId) {
       session.windowId = liveWindowId;
@@ -2447,6 +2449,13 @@ async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
           report.kept.push({ role, windowId, reason: 'busy' });
           continue;
         }
+        // Role-based busy checks miss a command whose tab was dragged in from the
+        // other owned surface, or a bound command sharing an owned lease's tab.
+        // Re-check by live membership before removing tabs or the window.
+        if (await windowHasActiveCommandTabs(windowId)) {
+          report.kept.push({ role, windowId, reason: 'busy' });
+          continue;
+        }
         const idleUrl = role === 'interactive' ? await idlePlaceholderUrl() : null;
         const ownedIds = new Set<number>();
         for (const tab of tabs) {
@@ -2475,12 +2484,6 @@ async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
           container.groupId = null;
           await persistRuntimeState();
           report.kept.push({ role, windowId, reason: 'user_tabs', closedTabs });
-          continue;
-        }
-        // Role-based busy checks miss a command whose tab the user dragged into
-        // this window from the other owned surface. Re-check by live membership.
-        if (await windowHasActiveCommandTabs(windowId)) {
-          report.kept.push({ role, windowId, reason: 'busy' });
           continue;
         }
         // `chrome.windows.remove` resolving is not proof: Edge kept answering

@@ -2113,6 +2113,7 @@ async function forgetClosedWindow(windowId) {
   }
   for (const [leaseKey, session] of automationSessions.entries()) {
     const liveTab = session.preferredTabId === null ? null : await chrome.tabs.get(session.preferredTabId).catch(() => null);
+    if (automationSessions.get(leaseKey) !== session) continue;
     const liveWindowId = liveTab?.windowId ?? session.windowId;
     if (liveWindowId !== windowId) {
       session.windowId = liveWindowId;
@@ -2976,6 +2977,10 @@ async function handleCloseOwnedWindows(cmd) {
           report.kept.push({ role, windowId, reason: "busy" });
           continue;
         }
+        if (await windowHasActiveCommandTabs(windowId)) {
+          report.kept.push({ role, windowId, reason: "busy" });
+          continue;
+        }
         const idleUrl = role === "interactive" ? await idlePlaceholderUrl() : null;
         const ownedIds = /* @__PURE__ */ new Set();
         for (const tab of tabs) {
@@ -2996,10 +3001,6 @@ async function handleCloseOwnedWindows(cmd) {
           container.groupId = null;
           await persistRuntimeState();
           report.kept.push({ role, windowId, reason: "user_tabs", closedTabs });
-          continue;
-        }
-        if (await windowHasActiveCommandTabs(windowId)) {
-          report.kept.push({ role, windowId, reason: "busy" });
           continue;
         }
         void chrome.windows.remove(windowId).catch(() => {
