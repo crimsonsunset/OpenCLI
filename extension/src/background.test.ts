@@ -3034,6 +3034,60 @@ describe('background tab isolation', () => {
     expect((result.data as any).kept).toEqual([{ role: 'automation', windowId: 1, reason: 'close_blocked' }]);
   });
 
+  it('abandons a window whose close prompt outlives every deadline instead of reusing it', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setOwnedWindowCloseTimeoutMs(50);
+    await mod.__test__.resolveTabId(undefined, adapterKey('first'));
+    const result = await mod.__test__.handleCommand({ id: 'close-blocked', action: 'close-owned-windows' });
+    expect((result.data as any).kept).toEqual([{ role: 'automation', windowId: 1, reason: 'close_blocked' }]);
+
+    // Prompt is still open well past both the caller deadline and any grace period.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    chrome.windows.create.mockResolvedValueOnce({ id: 5, focused: false } as any);
+    chrome.tabs.query.mockClear();
+    await mod.__test__.resolveTabId(undefined, adapterKey('next'));
+
+    expect(mod.__test__.getSession(adapterKey('first'))).toBeNull();
+    expect(chrome.windows.create).toHaveBeenCalled();
+    expect(mod.__test__.getSession(adapterKey('next'))).toEqual(expect.objectContaining({ windowId: 5 }));
+  });
+
+  it('keeps the lease of a browser-session tab whose group moved before its old window closed', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://session.example', title: 'session', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      [REGISTRY_KEY]: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: { interactive: { windowId: 7, groupIds: [400] }, automation: { windowId: null } },
+        leases: {},
+      },
+    });
+
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('work'), { windowId: 7, owned: true, preferredTabId: 70 });
+
+    // User drags the group into their own window 2, then the emptied window 7 closes.
+    tabs.find((tab) => tab.id === 70)!.windowId = 2;
+    groups[0].windowId = 2;
+    const onWindowRemoved = chrome.windows.onRemoved.addListener.mock.calls[0][0];
+    await onWindowRemoved(7);
+
+    expect(mod.__test__.getSession(browserKey('work'))).toEqual(expect.objectContaining({ windowId: 2, preferredTabId: 70 }));
+
+    const result = await mod.__test__.handleCommand({ id: 'close-moved', action: 'close-owned-windows' });
+
+    expect((result.data as any).kept).toEqual([{ role: 'interactive', windowId: 2, reason: 'user_tabs', closedTabs: 1 }]);
+    expect(tabs.some((tab) => tab.id === 70)).toBe(false);
+    expect(tabs.find((tab) => tab.id === 2)?.url).toBe('https://user.example');
+  });
+
   it('waits out a window that Chrome still reports right after removing it', async () => {
     // Measured on Edge 2026-09-17: windows.get kept answering for a few hundred ms
     // after the window was closed, so one eager check called every close blocked.
