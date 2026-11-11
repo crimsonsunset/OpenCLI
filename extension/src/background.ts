@@ -705,6 +705,13 @@ function isMissingTabGroupError(err: unknown): boolean {
   return err instanceof Error && /No group with id|group no longer exists/i.test(err.message);
 }
 
+/**
+ * Gather every live tab group that OpenCLI can prove it owns for a role, from
+ * the container pointer, the group ledger, lease tabs, and the idle placeholder.
+ *
+ * @param role - Owned window role; automation never groups, so it returns none.
+ * @returns Candidates for convergence into a single owned group.
+ */
 async function collectOwnedGroupCandidates(role: OwnedWindowRole): Promise<OwnedContainerGroupCandidate[]> {
   if (role === 'automation') return [];
 
@@ -1086,6 +1093,14 @@ async function ensureOwnedContainerWindowUnlocked(
   return { windowId: group?.windowId ?? container.windowId, initialTabId };
 }
 
+/**
+ * Find a tab in an owned container that a new session can claim.
+ *
+ * @param windowId - Container window to search.
+ * @param ownedGroupId - Owned group id, null when the container has no group, or
+ *   undefined to skip the group check.
+ * @returns The first unclaimed debuggable tab or idle placeholder, if any.
+ */
 async function findReusableOwnedContainerTab(windowId: number, ownedGroupId?: number | null): Promise<number | undefined> {
   const idleUrl = await idlePlaceholderUrl();
   const tabs = await chrome.tabs.query({ windowId });
@@ -2311,6 +2326,14 @@ function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFr
   return rest;
 }
 
+/**
+ * Close a session. `close-owned-tab` removes only the lease's own tab; plain
+ * close swaps the used page for a placeholder so a beforeunload guard can't block it.
+ *
+ * @param cmd - Incoming close-window or close-owned-tab command.
+ * @param leaseKey - Lease being closed.
+ * @returns Close result with the session name and, for owned tabs, the cleanup kind.
+ */
 async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result> {
   if (cmd.action === 'close-owned-tab') {
     return withLeaseMutation(async () => {
