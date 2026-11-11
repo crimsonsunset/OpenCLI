@@ -1534,7 +1534,7 @@ describe('background tab isolation', () => {
       tabs.splice(tabs.findIndex(tab => tab.id === tabId), 1);
     });
     vi.stubGlobal('chrome', chrome);
-    const mod = await import('./background');
+    let mod = await import('./background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     mod.__test__.setSession(browserKey('stuck'), { windowId: 7, owned: true, preferredTabId: 70 });
     const close = () => mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'stuck', surface: 'browser' });
@@ -1548,6 +1548,15 @@ describe('background tab isolation', () => {
     const windowTabs = tabs.filter(tab => tab.windowId === 7);
     expect(windowTabs).toHaveLength(1);
     expect(windowTabs[0].url).toMatch(/^chrome-extension:\/\/opencli\/idle.html#/);
+
+    // findIdleInteractiveGroup only recovers a single marked tab; prove that after
+    // session storage is cleared the retry placeholder is still that one candidate.
+    await chrome.storage.session.set({ opencli_target_lease_registry_v2: undefined });
+    vi.resetModules();
+    mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    expect(await mod.__test__.resolveTabId(undefined, browserKey('again'), 'https://target.example')).toBe(windowTabs[0].id);
+    expect(chrome.windows.create).not.toHaveBeenCalled();
   });
 
   it('opts into closing only the owned tab, preserving user pages and other sessions', async () => {
