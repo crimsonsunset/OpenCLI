@@ -394,10 +394,18 @@ async function evaluateViaUserScripts(tabId, expression, startedAt) {
   });
   const injection = results?.[0];
   if (injection?.error) {
-    throw new Error(String(injection.error));
+    throwExecutionStarted(String(injection.error));
   }
   console.log(`[opencli:eval] userScripts fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
   return injection?.result;
+}
+function throwExecutionStarted(message) {
+  const err = new Error(message);
+  err.executionStarted = true;
+  throw err;
+}
+function hasEvalExecutionStarted(err) {
+  return typeof err === "object" && err !== null && err.executionStarted === true;
 }
 async function evaluateViaScriptingWorld(tabId, expression, world) {
   const [injection] = await chrome.scripting.executeScript({
@@ -405,13 +413,25 @@ async function evaluateViaScriptingWorld(tabId, expression, world) {
     world,
     args: [expression],
     func: async (code) => {
+      let run;
       try {
-        const value = await (0, eval)(code);
+        run = (0, eval)(`(() => (0, eval)(${JSON.stringify(code)}))`);
+      } catch (err) {
+        return {
+          __opencli: true,
+          ok: false,
+          isBlocked: true,
+          error: err instanceof Error ? err.message : String(err)
+        };
+      }
+      try {
+        const value = await run();
         return { __opencli: true, ok: true, value };
       } catch (err) {
         return {
           __opencli: true,
           ok: false,
+          isBlocked: false,
           error: err instanceof Error ? err.message : String(err)
         };
       }
@@ -422,7 +442,9 @@ async function evaluateViaScriptingWorld(tabId, expression, world) {
     throw new Error("scripting fallback returned no result (likely CSP-blocked eval)");
   }
   if (!wrapped.ok) {
-    throw new Error(wrapped.error || "scripting fallback eval failed");
+    const message = wrapped.error || "scripting fallback eval failed";
+    if (wrapped.isBlocked) throw new Error(message);
+    throwExecutionStarted(message);
   }
   return wrapped.value;
 }
@@ -441,6 +463,7 @@ async function evaluateViaFallbacks(tabId, expression, startedAt) {
     } catch (scriptErr) {
       const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
       console.warn(`[opencli:eval] scripting MAIN fallback failed tab=${tabId}: ${scriptMsg}`);
+      if (hasEvalExecutionStarted(scriptErr)) throw scriptErr;
     }
   }
   try {
@@ -448,6 +471,7 @@ async function evaluateViaFallbacks(tabId, expression, startedAt) {
   } catch (userScriptErr) {
     const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
     console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+    if (hasEvalExecutionStarted(userScriptErr)) throw userScriptErr;
   }
   if (hasScripting) {
     try {
@@ -1385,6 +1409,7 @@ const IDLE_TIMEOUT_DEFAULT = 3e4;
 const IDLE_TIMEOUT_INTERACTIVE = 6e5;
 const IDLE_TIMEOUT_NONE = -1;
 const REGISTRY_KEY = "opencli_target_lease_registry_v2";
+const BROWSER_TAB_GROUPS_ENABLED_KEY = "opencli_browser_tab_groups_enabled";
 const LEASE_IDLE_ALARM_PREFIX = "opencli:lease-idle:";
 const CONTAINER_TAB_GROUP_TITLE = {
   interactive: "OpenCLI Browser",
@@ -1399,6 +1424,17 @@ const ownedContainers = {
   automation: { windowId: null, groupId: null, promise: null, groupPromise: null }
 };
 const interactiveGroupLedger = /* @__PURE__ */ new Set();
+let browserTabGroupingEnabled = true;
+async function loadBrowserTabGroupingPreference() {
+  try {
+    const local = chrome.storage?.local;
+    if (!local) return;
+    const raw = await local.get(BROWSER_TAB_GROUPS_ENABLED_KEY);
+    browserTabGroupingEnabled = raw[BROWSER_TAB_GROUPS_ENABLED_KEY] !== false;
+  } catch {
+    browserTabGroupingEnabled = true;
+  }
+}
 class CommandFailure extends Error {
   constructor(code, message, hint) {
     super(message);
@@ -1443,10 +1479,11 @@ function getSessionFromKey(key) {
     return key.slice(idx + 1);
   }
 }
+const AGGRESSIVE_ATTACH_SITES = ["amazon", "ticketmaster"];
 function shouldUseAggressiveAttach(leaseKey) {
   if (getSurfaceFromKey(leaseKey) === "browser") return true;
   const session = getSessionFromKey(leaseKey);
-  return session === "site:amazon" || session.startsWith("site:amazon:");
+  return AGGRESSIVE_ATTACH_SITES.some((site) => session === `site:${site}` || session.startsWith(`site:${site}:`));
 }
 function getIdleTimeout(key) {
   const session = automationSessions.get(key);
@@ -1805,7 +1842,7 @@ async function createOwnedGroup(role, windowId, ids) {
   return { id: group.id, windowId: group.windowId, title: group.title };
 }
 async function ensureOwnedContainerGroup(role, fallbackWindowId, tabIds) {
-  if (role === "automation") return null;
+  if (role === "automation" || !browserTabGroupingEnabled) return null;
   const ids = [...new Set(tabIds.filter((id) => id !== void 0))];
   const container = ownedContainers[role];
   const previousGroupPromise = container.groupPromise ?? Promise.resolve(null);
@@ -1815,6 +1852,50 @@ async function ensureOwnedContainerGroup(role, fallbackWindowId, tabIds) {
   });
   container.groupPromise = trackedGroupPromise;
   return trackedGroupPromise;
+}
+async function removeOwnedBrowserTabGroups() {
+  const container = ownedContainers.interactive;
+  const pendingGroup = container.groupPromise;
+  if (pendingGroup) await pendingGroup.catch(() => null);
+  const candidates = await collectOwnedGroupCandidates("interactive");
+  const failedGroupIds = /* @__PURE__ */ new Set();
+  for (const group of candidates) {
+    let tabIds;
+    try {
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      tabIds = tabs.map((tab) => tab.id).filter((id) => id !== void 0);
+    } catch {
+      failedGroupIds.add(group.id);
+      continue;
+    }
+    if (tabIds.length === 0) continue;
+    try {
+      await chrome.tabs.ungroup(tabIds);
+    } catch {
+      failedGroupIds.add(group.id);
+    }
+  }
+  if (failedGroupIds.size > 0) {
+    for (const id of [...interactiveGroupLedger]) {
+      if (!failedGroupIds.has(id)) interactiveGroupLedger.delete(id);
+    }
+    for (const id of failedGroupIds) interactiveGroupLedger.add(id);
+    if (container.groupId === null || !failedGroupIds.has(container.groupId)) {
+      container.groupId = [...failedGroupIds][0] ?? null;
+    }
+    await persistRuntimeState();
+    throw new Error(`Failed to ungroup ${failedGroupIds.size} owned tab group(s)`);
+  }
+  container.groupId = null;
+  interactiveGroupLedger.clear();
+  await persistRuntimeState();
+}
+async function setBrowserTabGroupingEnabled(enabled) {
+  await withLeaseMutation(async () => {
+    if (!enabled) await removeOwnedBrowserTabGroups();
+    await chrome.storage?.local?.set?.({ [BROWSER_TAB_GROUPS_ENABLED_KEY]: enabled });
+    browserTabGroupingEnabled = enabled;
+  });
 }
 async function ensureOwnedContainerGroupUnlocked(role, fallbackWindowId, ids) {
   try {
@@ -1875,10 +1956,7 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
           initialTabId: initialTabId2
         };
       }
-      if (role === "interactive") {
-        container.windowId = null;
-        container.groupId = null;
-      } else {
+      if (role === "automation" || !browserTabGroupingEnabled) {
         await focusOwnedWindowIfRequested(windowId, mode);
         const initialTabId2 = await findReusableOwnedContainerTab(windowId, null);
         return {
@@ -1886,6 +1964,8 @@ async function ensureOwnedContainerWindowUnlocked(role, initialUrl, mode = "back
           initialTabId: initialTabId2
         };
       }
+      container.windowId = null;
+      container.groupId = null;
     }
   }
   const existingGroup = await ensureOwnedContainerGroup(role, null, []);
@@ -2160,7 +2240,9 @@ function initialize() {
   workerRecovered = false;
   workerReady = (async () => {
     await getCurrentContextId();
+    await loadBrowserTabGroupingPreference();
     await reconcileTargetLeaseRegistry();
+    if (!browserTabGroupingEnabled) await removeOwnedBrowserTabGroups();
   })().catch((err) => {
     console.warn(`[opencli] Startup recovery failed: ${err instanceof Error ? err.message : String(err)}`);
   }).finally(() => {
@@ -2190,6 +2272,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "getStatus") {
     void (async () => {
+      await workerReady;
       const contextId = await getCurrentContextId();
       const connected = ws?.readyState === WebSocket.OPEN;
       const extensionVersion = chrome.runtime.getManifest().version;
@@ -2199,8 +2282,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         reconnecting: reconnectTimer !== null,
         contextId,
         extensionVersion,
-        daemonVersion
+        daemonVersion,
+        browserTabGroupingEnabled
       });
+    })();
+    return true;
+  }
+  if (msg?.type === "setBrowserTabGrouping" && typeof msg.enabled === "boolean") {
+    void (async () => {
+      await workerReady;
+      try {
+        await setBrowserTabGroupingEnabled(msg.enabled);
+        sendResponse({ ok: true, browserTabGroupingEnabled });
+      } catch (err) {
+        sendResponse({
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+          browserTabGroupingEnabled
+        });
+      }
     })();
     return true;
   }
