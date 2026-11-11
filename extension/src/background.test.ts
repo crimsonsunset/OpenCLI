@@ -1559,6 +1559,26 @@ describe('background tab isolation', () => {
     expect(chrome.windows.create).not.toHaveBeenCalled();
   });
 
+  it('lets only one of two concurrent closes swap in a placeholder', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    chrome.tabs.remove.mockImplementation(async (tabId: number) => {
+      tabs.splice(tabs.findIndex(tab => tab.id === tabId), 1);
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('dup'), { windowId: 7, owned: true, preferredTabId: 70 });
+    const close = (id: string) => mod.__test__.handleCommand({ id, action: 'close-window', session: 'dup', surface: 'browser' });
+
+    const results = await Promise.all([close('a'), close('b')]);
+
+    expect(results.filter(result => result.ok)).toHaveLength(1);
+    expect(chrome.tabs.create).toHaveBeenCalledTimes(1);
+    expect(tabs.filter(tab => tab.windowId === 7)).toHaveLength(1);
+  });
+
   it('does not hand a pending close placeholder to another session that a failed close then deletes', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });

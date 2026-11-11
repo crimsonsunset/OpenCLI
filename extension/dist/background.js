@@ -2918,9 +2918,17 @@ async function handleCloseWindow(cmd, leaseKey) {
       }
     });
   }
-  const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
-  await releaseLease(leaseKey, "explicit close", true);
-  return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
+  if (closingLeases.has(leaseKey)) {
+    throw new CommandFailure("session_busy", "This session is already closing; retry after cleanup finishes.");
+  }
+  closingLeases.add(leaseKey);
+  try {
+    const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
+    await releaseLease(leaseKey, "explicit close", true);
+    return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
+  } finally {
+    closingLeases.delete(leaseKey);
+  }
 }
 async function handleSetFileInput(cmd, leaseKey) {
   if (!cmd.files || !Array.isArray(cmd.files) || cmd.files.length === 0) {

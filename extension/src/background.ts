@@ -2376,9 +2376,19 @@ async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result
       }
     });
   }
-  const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
-  await releaseLease(leaseKey, 'explicit close', true);
-  return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
+  // Two concurrent closes would each create a placeholder; one could survive and
+  // break single-tab idle recovery. Hold the lease for the whole swap.
+  if (closingLeases.has(leaseKey)) {
+    throw new CommandFailure('session_busy', 'This session is already closing; retry after cleanup finishes.');
+  }
+  closingLeases.add(leaseKey);
+  try {
+    const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
+    await releaseLease(leaseKey, 'explicit close', true);
+    return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
+  } finally {
+    closingLeases.delete(leaseKey);
+  }
 }
 
 async function handleSetFileInput(cmd: Command, leaseKey: string): Promise<Result> {
