@@ -139,7 +139,14 @@ function createChromeMock() {
       query,
       create,
       update,
-      remove: vi.fn(async (_tabId: number) => {}),
+      remove: vi.fn(async (tabId: number | number[]) => {
+        const ids = Array.isArray(tabId) ? tabId : [tabId];
+        for (const id of ids) {
+          const idx = tabs.findIndex((entry) => entry.id === id);
+          if (idx !== -1) tabs.splice(idx, 1);
+        }
+        removeEmptyGroups();
+      }),
       get: vi.fn(async (tabId: number) => {
         const tab = tabs.find((entry) => entry.id === tabId);
         if (!tab) throw new Error(`Unknown tab ${tabId}`);
@@ -1518,9 +1525,12 @@ describe('background tab isolation', () => {
   it('opts into closing only the owned tab, preserving user pages and other sessions', async () => {
     const { chrome, tabs } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
-    chrome.tabs.remove.mockImplementation(async (id: number) => {
-      const index = tabs.findIndex(tab => tab.id === id);
-      if (index >= 0) tabs.splice(index, 1);
+    chrome.tabs.remove.mockImplementation(async (tabId: number | number[]) => {
+      const ids = Array.isArray(tabId) ? tabId : [tabId];
+      for (const id of ids) {
+        const index = tabs.findIndex(tab => tab.id === id);
+        if (index >= 0) tabs.splice(index, 1);
+      }
     });
     const mod = await import('./background');
     await mod.__test__.resolveTabId(undefined, browserKey('first'));
@@ -2977,7 +2987,7 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('first'))).not.toBeNull();
   });
 
-  it('closes only opencli tabs when the browser-session group sits in a user window', async () => {
+  it('closes only leased or placeholder tabs when the browser-session group sits in a user window', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({ id: 60, windowId: 2, url: 'https://session.example', title: 'session', active: false, status: 'complete', groupId: 300 });
     tabs.push({ id: 61, windowId: 2, url: 'about:blank', title: 'blank', active: false, status: 'complete', groupId: 300 });
@@ -2994,13 +3004,16 @@ describe('background tab isolation', () => {
 
     const mod = await import('./background');
     await mod.__test__.reconcileTargetLeaseRegistry();
+    // Group membership and bare about:blank are not enough; only the leased tab closes.
+    mod.__test__.setSession(browserKey('work'), { windowId: 2, owned: true, preferredTabId: 60 });
 
     const result = await mod.__test__.handleCommand({ id: 'close-user-window', action: 'close-owned-windows' });
 
     expect(result.ok).toBe(true);
-    expect((result.data as any).kept).toEqual([{ role: 'interactive', windowId: 2, reason: 'user_tabs', closedTabs: 2 }]);
-    expect(chrome.tabs.remove).toHaveBeenCalledWith([60, 61]);
+    expect((result.data as any).kept).toEqual([{ role: 'interactive', windowId: 2, reason: 'user_tabs', closedTabs: 1 }]);
+    expect(chrome.tabs.remove).toHaveBeenCalledWith([60]);
     expect(chrome.windows.remove).not.toHaveBeenCalled();
+    expect(tabs.find((tab) => tab.id === 61)?.url).toBe('about:blank');
     expect(tabs.find((tab) => tab.id === 2)?.url).toBe('https://user.example');
     expect(mod.__test__.getInteractiveContainer().windowId).toBeNull();
   });
