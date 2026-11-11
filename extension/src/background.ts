@@ -2441,12 +2441,12 @@ async function releaseLease(leaseKey: string, reason: string = 'released', repla
         await chrome.tabs.remove(tabId).catch(() => {});
         console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
       } else {
+        let placeholderId = tabId;
         try {
           const role = getOwnedWindowRole(leaseKey);
           const idleUrl = role === 'interactive'
             ? await parkIdleInteractiveTab(tabId, session.windowId) : null;
           const placeholderUrl = idleUrl ?? BLANK_PAGE;
-          let placeholderId = tabId;
           if (replaceTab) {
             // Navigating the used page runs its beforeunload guard, which can block
             // teardown on a Chrome prompt (#2163). Swap in a fresh tab instead, grouped
@@ -2465,7 +2465,9 @@ async function releaseLease(leaseKey: string, reason: string = 'released', repla
             () => chrome.tabs.get(tabId).then(() => false, () => true),
           );
           // Explicit close keeps the lease when the used page survives, so the caller can retry.
+          // Drop the fresh placeholder too, or each retry adds one and breaks single-tab idle recovery.
           if (replaceTab && !isUsedTabGone) {
+            if (placeholderId !== tabId) await chrome.tabs.remove(placeholderId).catch(() => {});
             throw new Error(`Failed to remove owned tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`);
           }
           console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);

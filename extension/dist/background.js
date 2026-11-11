@@ -2996,11 +2996,11 @@ async function releaseLease(leaseKey, reason = "released", replaceTab = false) {
         });
         console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
       } else {
+        let placeholderId = tabId;
         try {
           const role = getOwnedWindowRole(leaseKey);
           const idleUrl = role === "interactive" ? await parkIdleInteractiveTab(tabId, session.windowId) : null;
           const placeholderUrl = idleUrl ?? BLANK_PAGE;
-          let placeholderId = tabId;
           if (replaceTab) {
             placeholderId = (await chrome.tabs.create({ windowId: session.windowId, url: placeholderUrl, active: true })).id ?? tabId;
           } else {
@@ -3016,6 +3016,8 @@ async function releaseLease(leaseKey, reason = "released", replaceTab = false) {
             () => chrome.tabs.get(tabId).then(() => false, () => true)
           );
           if (replaceTab && !isUsedTabGone) {
+            if (placeholderId !== tabId) await chrome.tabs.remove(placeholderId).catch(() => {
+            });
             throw new Error(`Failed to remove owned tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`);
           }
           console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);

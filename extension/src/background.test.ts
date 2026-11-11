@@ -1524,17 +1524,30 @@ describe('background tab isolation', () => {
     expect(chrome.windows.remove).not.toHaveBeenCalled();
   });
 
-  it('keeps the lease when explicit close cannot remove the used page', async () => {
-    const { chrome } = createChromeMock();
+  it('keeps the lease when explicit close cannot remove the used page, and a retry leaves one placeholder', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    let isUsedTabLocked = true;
+    chrome.tabs.remove.mockImplementation(async (tabId: number) => {
+      if (tabId === 70 && isUsedTabLocked) throw new Error('Tab is locked');
+      tabs.splice(tabs.findIndex(tab => tab.id === tabId), 1);
+    });
     vi.stubGlobal('chrome', chrome);
-
     const mod = await import('./background');
-    await mod.__test__.resolveTabId(undefined, adapterKey('stuck'));
-    chrome.tabs.remove.mockRejectedValue(new Error('Tab is locked'));
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('stuck'), { windowId: 7, owned: true, preferredTabId: 70 });
+    const close = () => mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'stuck', surface: 'browser' });
 
-    const result = await mod.__test__.handleCommand({ id: 'close-stuck', action: 'close-window', session: 'stuck', surface: 'adapter' });
-    expect(result).toEqual(expect.objectContaining({ ok: false }));
-    expect(mod.__test__.getSession(adapterKey('stuck'))).toEqual(expect.objectContaining({ preferredTabId: 1 }));
+    expect(await close()).toEqual(expect.objectContaining({ ok: false }));
+    expect(mod.__test__.getSession(browserKey('stuck'))).toEqual(expect.objectContaining({ preferredTabId: 70 }));
+    expect(tabs.filter(tab => tab.windowId === 7).map(tab => tab.id)).toEqual([70]);
+
+    isUsedTabLocked = false;
+    expect(await close()).toEqual(expect.objectContaining({ ok: true }));
+    const windowTabs = tabs.filter(tab => tab.windowId === 7);
+    expect(windowTabs).toHaveLength(1);
+    expect(windowTabs[0].url).toMatch(/^chrome-extension:\/\/opencli\/idle.html#/);
   });
 
   it('opts into closing only the owned tab, preserving user pages and other sessions', async () => {
