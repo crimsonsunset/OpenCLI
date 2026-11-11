@@ -395,6 +395,8 @@ const closingLeases = new Set<string>();
 const closingTabs = new Set<number>();
 /** Roles whose owned container is mid-close; blocks new commands on that surface. */
 const closingOwnedRoles = new Set<OwnedWindowRole>();
+/** Role → windowId for close attempts still unresolved past the caller deadline. */
+const pendingOwnedWindowCloses = new Map<OwnedWindowRole, number>();
 const LEASE_KEY_SEPARATOR = '\u0000';
 
 function getLeaseKey(session: string, surface: BrowserSurface): string {
@@ -1321,10 +1323,15 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 
 /** Drop every container pointer and lease that lived in a window that is gone. */
 async function forgetClosedWindow(windowId: number): Promise<void> {
-  for (const container of Object.values(ownedContainers)) {
+  for (const role of ['automation', 'interactive'] as const) {
+    const container = ownedContainers[role];
     if (container.windowId === windowId) {
       container.windowId = null;
       container.groupId = null;
+    }
+    if (pendingOwnedWindowCloses.get(role) === windowId) {
+      pendingOwnedWindowCloses.delete(role);
+      closingOwnedRoles.delete(role);
     }
   }
   for (const [leaseKey, session] of automationSessions.entries()) {
@@ -2383,8 +2390,8 @@ type OwnedWindowCloseReport = {
  * a user window, and the user's other tabs there stay open. Group membership or
  * a bare about:blank is not ownership evidence.
  * Chrome closes a window together with its last tab. A window that is still
- * open when the close deadline passes (a "Leave site?" prompt) is reported, not
- * retried.
+ * open when the close deadline passes (a "Leave site?" prompt) is reported as
+ * close_blocked; the role stays reserved until that close attempt settles.
  * @param cmd - Incoming close-owned-windows command
  */
 async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
@@ -2403,6 +2410,7 @@ async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
       // Reserve before any further await so admission rejects new commands on
       // this role; withLeaseMutation alone does not cover their full execution.
       closingOwnedRoles.add(role);
+      let releaseRoleReservation = true;
       try {
         if ([...activeCommandCounts.keys()].some((leaseKey) => getOwnedWindowRole(leaseKey) === role)) {
           report.kept.push({ role, windowId, reason: 'busy' });
@@ -2438,7 +2446,14 @@ async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
             report.kept.push({ role, windowId, reason: 'close_blocked', closedTabs });
             continue;
           }
-          // The window is the user's; opencli no longer keeps a container in it.
+          // The window is the user's; drop group ownership so survivors are not
+          // re-adopted by a later ensureOwnedContainerGroup convergence.
+          const retiredGroupId = container.groupId;
+          const survivorIds = tabs
+            .filter((tab) => tab.id !== undefined && !ownedIds.has(tab.id)
+              && retiredGroupId !== null && tab.groupId === retiredGroupId)
+            .map((tab) => tab.id!);
+          await retireInteractiveGroupOwnership(retiredGroupId, survivorIds);
           container.windowId = null;
           container.groupId = null;
           await persistRuntimeState();
@@ -2449,20 +2464,74 @@ async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
         // `windows.get` for a few hundred ms after a window it had closed
         // (measured 2026-09-17, which made every normal close report as blocked).
         // Poll until the window is really gone, and let its own promise settle.
-        void chrome.windows.remove(windowId).catch(() => {});
+        const removeDone = chrome.windows.remove(windowId).then(() => {}, () => {});
         if (!await windowClosedBefore(windowId, Date.now() + ownedWindowCloseTimeoutMs)) {
           report.kept.push({ role, windowId, reason: 'close_blocked' });
+          // Keep the role reserved: a beforeunload prompt may still close this
+          // window after the caller deadline. Release only once settled.
+          releaseRoleReservation = false;
+          pendingOwnedWindowCloses.set(role, windowId);
+          void settleOwnedWindowCloseAttempt(role, windowId, removeDone);
           continue;
         }
         await forgetClosedWindow(windowId);
         console.log(`[opencli] Closed owned ${role} window ${windowId} (${tabs.length} tabs, explicit close)`);
         report.closed.push({ role, windowId, tabs: tabs.length });
       } finally {
-        closingOwnedRoles.delete(role);
+        if (releaseRoleReservation) closingOwnedRoles.delete(role);
       }
     }
     return { id: cmd.id, ok: true, data: report };
   });
+}
+
+/**
+ * Remove ledger ownership and ungroup surviving user tabs for a retired
+ * interactive group so ensureOwnedContainerGroup cannot adopt it again.
+ * @param groupId - Group id to retire, or null when none was tracked
+ * @param survivorTabIds - Tabs still open that may remain in that group
+ */
+async function retireInteractiveGroupOwnership(
+  groupId: number | null,
+  survivorTabIds: number[],
+): Promise<void> {
+  if (groupId === null) return;
+  interactiveGroupLedger.delete(groupId);
+  if (survivorTabIds.length === 0) return;
+  try {
+    await chrome.tabs.ungroup(survivorTabIds);
+  } catch {
+    // Group may already be gone after owned-tab removal.
+  }
+}
+
+/**
+ * Hold closingOwnedRoles past the caller deadline until the window is gone or
+ * still open after remove settles (user chose Stay / close failed).
+ * ponytail: chrome.windows.remove can RespondNow while beforeunload is still
+ * open; one grace period after settle is the ceiling. Upgrade: prompt-aware API.
+ * @param role - Owned surface whose reservation remains held
+ * @param windowId - Window that may still close after the deadline
+ * @param removeDone - Resolves when chrome.windows.remove finishes or rejects
+ */
+async function settleOwnedWindowCloseAttempt(
+  role: OwnedWindowRole,
+  windowId: number,
+  removeDone: Promise<void>,
+): Promise<void> {
+  try {
+    await removeDone;
+    if (await windowClosedBefore(windowId, Date.now() + ownedWindowCloseTimeoutMs)) {
+      await withLeaseMutation(async () => {
+        await forgetClosedWindow(windowId);
+      });
+    }
+  } finally {
+    if (pendingOwnedWindowCloses.get(role) === windowId) {
+      pendingOwnedWindowCloses.delete(role);
+      closingOwnedRoles.delete(role);
+    }
+  }
 }
 
 /**
