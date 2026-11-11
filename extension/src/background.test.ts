@@ -804,17 +804,24 @@ describe('background tab isolation', () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
     groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    chrome.tabs.remove.mockImplementation(async (tabId: number) => {
+      tabs.splice(tabs.findIndex(tab => tab.id === tabId), 1);
+    });
     vi.stubGlobal('chrome', chrome);
     let mod = await import('./background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     mod.__test__.setSession(browserKey('owned'), { windowId: 7, owned: true, preferredTabId: 70 });
     await mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'owned', surface: 'browser' });
-    expect(tabs.find(tab => tab.id === 70)?.url).toMatch(/^chrome-extension:\/\/opencli\/idle.html#/);
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(70, expect.anything());
+    expect(tabs.find(tab => tab.id === 70)).toBeUndefined();
+    const placeholder = tabs.find(tab => tab.windowId === 7);
+    expect(placeholder?.url).toMatch(/^chrome-extension:\/\/opencli\/idle.html#/);
+    expect(placeholder?.groupId).toBe(400);
     await chrome.storage.session.set({ opencli_target_lease_registry_v2: undefined });
     vi.resetModules();
     mod = await import('./background');
     await mod.__test__.reconcileTargetLeaseRegistry();
-    expect(await mod.__test__.resolveTabId(undefined, browserKey('again'), 'https://target.example')).toBe(70);
+    expect(await mod.__test__.resolveTabId(undefined, browserKey('again'), 'https://target.example')).toBe(placeholder?.id);
     expect(chrome.windows.create).not.toHaveBeenCalled();
   });
 
@@ -1523,8 +1530,129 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('second'))).toBeNull();
 
     await mod.__test__.handleCommand({ id: 'close-first', action: 'close-window', session: 'first', surface: 'adapter' });
-    expect(chrome.tabs.update).toHaveBeenCalledWith(1, { url: 'about:blank' });
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
+    expect(chrome.tabs.create).toHaveBeenLastCalledWith({ windowId: 1, url: 'about:blank', active: true });
+    expect(chrome.tabs.remove.mock.calls.at(-1)).toEqual([1]);
     expect(chrome.windows.remove).not.toHaveBeenCalled();
+  });
+
+  it('keeps the lease when explicit close cannot remove the used page, and a retry leaves one placeholder', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    let isUsedTabLocked = true;
+    chrome.tabs.remove.mockImplementation(async (tabId: number) => {
+      if (tabId === 70 && isUsedTabLocked) throw new Error('Tab is locked');
+      tabs.splice(tabs.findIndex(tab => tab.id === tabId), 1);
+    });
+    vi.stubGlobal('chrome', chrome);
+    let mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('stuck'), { windowId: 7, owned: true, preferredTabId: 70 });
+    const close = () => mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'stuck', surface: 'browser' });
+
+    expect(await close()).toEqual(expect.objectContaining({ ok: false }));
+    expect(mod.__test__.getSession(browserKey('stuck'))).toEqual(expect.objectContaining({ preferredTabId: 70 }));
+    expect(tabs.filter(tab => tab.windowId === 7).map(tab => tab.id)).toEqual([70]);
+
+    isUsedTabLocked = false;
+    expect(await close()).toEqual(expect.objectContaining({ ok: true }));
+    const windowTabs = tabs.filter(tab => tab.windowId === 7);
+    expect(windowTabs).toHaveLength(1);
+    expect(windowTabs[0].url).toMatch(/^chrome-extension:\/\/opencli\/idle.html#/);
+
+    // findIdleInteractiveGroup only recovers a single marked tab; prove that after
+    // session storage is cleared the retry placeholder is still that one candidate.
+    await chrome.storage.session.set({ opencli_target_lease_registry_v2: undefined });
+    vi.resetModules();
+    mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    expect(await mod.__test__.resolveTabId(undefined, browserKey('again'), 'https://target.example')).toBe(windowTabs[0].id);
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('lets only one of two concurrent closes swap in a placeholder', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    chrome.tabs.remove.mockImplementation(async (tabId: number) => {
+      tabs.splice(tabs.findIndex(tab => tab.id === tabId), 1);
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('dup'), { windowId: 7, owned: true, preferredTabId: 70 });
+    const close = (id: string) => mod.__test__.handleCommand({ id, action: 'close-window', session: 'dup', surface: 'browser' });
+
+    const results = await Promise.all([close('a'), close('b')]);
+
+    // Queued second close is idempotent once the lease is gone; both may report ok.
+    expect(results.some(result => result.ok)).toBe(true);
+    expect(chrome.tabs.create).toHaveBeenCalledTimes(1);
+    expect(tabs.filter(tab => tab.windowId === 7)).toHaveLength(1);
+  });
+
+  it('does not hand a pending close placeholder to another session that a failed close then deletes', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    let failUsedTabRemoval: ((err: Error) => void) | null = null;
+    chrome.tabs.remove.mockImplementation(async (tabId: number) => {
+      if (tabId === 70 && !failUsedTabRemoval) return new Promise<void>((_, reject) => { failUsedTabRemoval = reject; });
+      if (tabId === 70) throw new Error('Tab is locked');
+      tabs.splice(tabs.findIndex(tab => tab.id === tabId), 1);
+    });
+    chrome.tabs.get.mockImplementation(async (tabId: number) => {
+      const tab = tabs.find(candidate => candidate.id === tabId);
+      if (!tab) throw new Error(`No tab with id: ${tabId}`);
+      return tab;
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('stuck'), { windowId: 7, owned: true, preferredTabId: 70 });
+
+    const close = mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'stuck', surface: 'browser' });
+    await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledWith(70));
+    const placeholderId = (await chrome.tabs.create.mock.results.at(-1)?.value)?.id;
+    const otherTabId = await mod.__test__.resolveTabId(undefined, browserKey('other'), 'https://other.example');
+    expect(otherTabId).not.toBe(placeholderId);
+
+    failUsedTabRemoval!(new Error('Tab is locked'));
+    expect(await close).toEqual(expect.objectContaining({ ok: false }));
+    expect(tabs.some(tab => tab.id === otherTabId)).toBe(true);
+  });
+
+  it('serializes concurrent close-window so only one replacement placeholder remains', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    let releaseUsedTabRemoval: (() => void) | null = null;
+    chrome.tabs.remove.mockImplementation(async (tabId: number) => {
+      if (tabId === 70 && !releaseUsedTabRemoval) {
+        await new Promise<void>(resolve => { releaseUsedTabRemoval = resolve; });
+      }
+      const index = tabs.findIndex(tab => tab.id === tabId);
+      if (index >= 0) tabs.splice(index, 1);
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('stuck'), { windowId: 7, owned: true, preferredTabId: 70 });
+
+    // Fire both before either finishes so they share the lease mutation queue.
+    const first = mod.__test__.handleCommand({ id: 'close-1', action: 'close-window', session: 'stuck', surface: 'browser' });
+    const second = mod.__test__.handleCommand({ id: 'close-2', action: 'close-window', session: 'stuck', surface: 'browser' });
+    await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledWith(70));
+    expect(chrome.tabs.create).toHaveBeenCalledTimes(1);
+
+    releaseUsedTabRemoval!();
+    const results = await Promise.all([first, second]);
+    expect(results.some(result => result.ok)).toBe(true);
+    expect(chrome.tabs.create).toHaveBeenCalledTimes(1);
+    const windowTabs = tabs.filter(tab => tab.windowId === 7);
+    expect(windowTabs).toHaveLength(1);
+    expect(windowTabs[0].url).toMatch(/^chrome-extension:\/\/opencli\/idle.html#/);
   });
 
   it('opts into closing only the owned tab, preserving user pages and other sessions', async () => {

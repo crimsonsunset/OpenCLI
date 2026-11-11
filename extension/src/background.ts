@@ -358,6 +358,10 @@ async function loadBrowserTabGroupingPreference(): Promise<void> {
   }
 }
 
+// Replacement placeholders created by an explicit close, held until the used tab is
+// removed so another session can't claim one that a failed close then deletes.
+const pendingPlaceholderTabs = new Set<number>();
+
 type StoredLease = Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt'> & {
   idleDeadlineAt: number;
   updatedAt: number;
@@ -412,9 +416,25 @@ function setSessionOverride(key: string, patch: SessionOverrides): void {
 const activeCommandCounts = new Map<string, number>();
 const closingLeases = new Set<string>();
 const closingTabs = new Set<number>();
+/** Per-lease queue so concurrent close-window/close-owned-tab can't interleave. */
+const leaseCloseQueues = new Map<string, Promise<unknown>>();
 /** Roles whose owned container is mid-close; blocks new commands on that surface. */
 const closingOwnedRoles = new Set<OwnedWindowRole>();
 const LEASE_KEY_SEPARATOR = '\u0000';
+
+/**
+ * Serialize close work for one lease without blocking other leases' mutations
+ * (e.g. another session claiming a tab while this close's used-tab remove is pending).
+ *
+ * @param leaseKey - Lease whose close operations must not overlap.
+ * @param fn - Close body to run.
+ * @returns Result of `fn`.
+ */
+function withLeaseClose<T>(leaseKey: string, fn: () => Promise<T>): Promise<T> {
+  const run = (leaseCloseQueues.get(leaseKey) ?? Promise.resolve()).then(fn, fn);
+  leaseCloseQueues.set(leaseKey, run.then(() => undefined, () => undefined));
+  return run;
+}
 
 function getLeaseKey(session: string, surface: BrowserSurface): string {
   return `${surface}${LEASE_KEY_SEPARATOR}${encodeURIComponent(session)}`;
@@ -728,6 +748,13 @@ function isMissingTabGroupError(err: unknown): boolean {
   return err instanceof Error && /No group with id|group no longer exists/i.test(err.message);
 }
 
+/**
+ * Gather every live tab group that OpenCLI can prove it owns for a role, from
+ * the container pointer, the group ledger, lease tabs, and the idle placeholder.
+ *
+ * @param role - Owned window role; automation never groups, so it returns none.
+ * @returns Candidates for convergence into a single owned group.
+ */
 async function collectOwnedGroupCandidates(role: OwnedWindowRole): Promise<OwnedContainerGroupCandidate[]> {
   if (role === 'automation') return [];
 
@@ -814,6 +841,7 @@ async function collectOwnedGroupCandidates(role: OwnedWindowRole): Promise<Owned
   if (groupsById.size === 0) {
     const reservedTabs = new Set([...automationSessions.values()]
       .flatMap(session => session.preferredTabId === null ? [] : [session.preferredTabId]));
+    pendingPlaceholderTabs.forEach(tabId => reservedTabs.add(tabId));
     const idleGroup = await findIdleInteractiveGroup(reservedTabs);
     if (idleGroup) groupsById.set(idleGroup.id, idleGroup);
   }
@@ -1183,6 +1211,14 @@ async function ensureOwnedContainerWindowUnlocked(
   return { windowId: group?.windowId ?? container.windowId, initialTabId };
 }
 
+/**
+ * Find a tab in an owned container that a new session can claim.
+ *
+ * @param windowId - Container window to search.
+ * @param ownedGroupId - Owned group id, null when the container has no group, or
+ *   undefined to skip the group check.
+ * @returns The first unclaimed debuggable tab or idle placeholder, if any.
+ */
 async function findReusableOwnedContainerTab(windowId: number, ownedGroupId?: number | null): Promise<number | undefined> {
   const idleUrl = await idlePlaceholderUrl();
   const tabs = await chrome.tabs.query({ windowId });
@@ -1201,9 +1237,17 @@ async function findReusableOwnedContainerTab(windowId: number, ownedGroupId?: nu
   return reusable?.id;
 }
 
+/**
+ * Check whether a tab can be claimed as a session's initial tab.
+ *
+ * @param tabId - Candidate tab.
+ * @returns False for poisoned tabs, tabs leased by an owned session, or replacement
+ *   placeholders still pending in an explicit close.
+ */
 function initialTabIsAvailable(tabId: number | undefined): tabId is number {
   if (tabId === undefined) return false;
   if (executor.isTabPoisoned(tabId)) return false;
+  if (pendingPlaceholderTabs.has(tabId)) return false;
   for (const session of automationSessions.values()) {
     if (session.owned && session.preferredTabId === tabId) return false;
   }
@@ -2456,9 +2500,19 @@ function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFr
   return rest;
 }
 
+/**
+ * Close a session. `close-owned-tab` removes only the lease's own tab; plain
+ * close swaps the used page for a placeholder so a beforeunload guard can't block it.
+ * Both paths reserve the lease for the full close and serialize per-lease so concurrent
+ * closes cannot create competing placeholders.
+ *
+ * @param cmd - Incoming close-window or close-owned-tab command.
+ * @param leaseKey - Lease being closed.
+ * @returns Close result with the session name and, for owned tabs, the cleanup kind.
+ */
 async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result> {
   if (cmd.action === 'close-owned-tab') {
-    return withLeaseMutation(async () => {
+    return withLeaseClose(leaseKey, () => withLeaseMutation(async () => {
       if ((activeCommandCounts.get(leaseKey) ?? 0) > 1) {
         throw new CommandFailure('session_busy', 'Cannot close a tab while another command is using this session.');
       }
@@ -2496,11 +2550,22 @@ async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result
         closingLeases.delete(leaseKey);
         if (closingTabId !== undefined) closingTabs.delete(closingTabId);
       }
-    });
+    }));
   }
-  const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
-  await releaseLease(leaseKey, 'explicit close');
-  return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
+  // Per-lease close queue (not the global mutation lock): another session can still
+  // create tabs while used-tab removal is pending; closingLeases + pendingPlaceholderTabs
+  // keep that session off this lease's placeholder. closingLeases alone is racy when two
+  // closes both pass the empty check before either adds.
+  return withLeaseClose(leaseKey, async () => {
+    closingLeases.add(leaseKey);
+    try {
+      const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
+      await releaseLease(leaseKey, 'explicit close', true);
+      return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
+    } finally {
+      closingLeases.delete(leaseKey);
+    }
+  });
 }
 
 let ownedWindowCloseTimeoutMs = 5_000;
@@ -2810,7 +2875,17 @@ async function handleWaitDownload(cmd: Command): Promise<Result> {
   }
 }
 
-async function releaseLease(leaseKey: string, reason: string = 'released'): Promise<void> {
+/**
+ * Release a lease. The last owned tab in a container becomes a reusable placeholder
+ * (marked idle.html for interactive single-tab windows) instead of closing the window.
+ *
+ * @param leaseKey - Lease to release.
+ * @param reason - Log label for why the lease ended.
+ * @param replaceTab - Swap the used page for a fresh placeholder tab instead of navigating it,
+ *   so the page's beforeunload guard can't block teardown. Used for explicit close.
+ * @throws When `replaceTab` is set and the used page can't be removed; the lease is kept for retry.
+ */
+async function releaseLease(leaseKey: string, reason: string = 'released', replaceTab = false): Promise<void> {
   const session = automationSessions.get(leaseKey);
   if (!session) {
     sessionOverrides.delete(leaseKey);
@@ -2837,17 +2912,39 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
         await chrome.tabs.remove(tabId).catch(() => {});
         console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
       } else {
+        let placeholderId = tabId;
         try {
           const role = getOwnedWindowRole(leaseKey);
           const idleUrl = role === 'interactive'
             ? await parkIdleInteractiveTab(tabId, session.windowId) : null;
-          const tab = await chrome.tabs.update(tabId, { url: idleUrl ?? BLANK_PAGE, active: true });
-          const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), session.windowId, [tab.id ?? tabId]);
+          const placeholderUrl = idleUrl ?? BLANK_PAGE;
+          if (replaceTab) {
+            // Navigating the used page runs its beforeunload guard, which can block
+            // teardown on a Chrome prompt (#2163). Swap in a fresh tab instead, grouped
+            // before the old one goes so the group never empties and gets saved.
+            placeholderId = (await chrome.tabs.create({ windowId: session.windowId, url: placeholderUrl, active: true })).id ?? tabId;
+            pendingPlaceholderTabs.add(placeholderId);
+          } else {
+            placeholderId = (await chrome.tabs.update(tabId, { url: placeholderUrl, active: true })).id ?? tabId;
+          }
+          const group = await ensureOwnedContainerGroup(role, session.windowId, [placeholderId]);
+          if (placeholderId !== tabId) await chrome.tabs.remove(tabId);
           if (group) session.windowId = group.windowId;
           console.log(`[opencli] Released owned tab lease ${tabId} as reusable placeholder (session=${session.session}, surface=${session.surface}, ${reason})`);
-        } catch {
-          await chrome.tabs.remove(tabId).catch(() => {});
+        } catch (err) {
+          const isUsedTabGone = await chrome.tabs.remove(tabId).then(
+            () => true,
+            () => chrome.tabs.get(tabId).then(() => false, () => true),
+          );
+          // Explicit close keeps the lease when the used page survives, so the caller can retry.
+          // Drop the fresh placeholder too, or each retry adds one and breaks single-tab idle recovery.
+          if (replaceTab && !isUsedTabGone) {
+            if (placeholderId !== tabId) await chrome.tabs.remove(placeholderId).catch(() => {});
+            throw new Error(`Failed to remove owned tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
           console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
+        } finally {
+          pendingPlaceholderTabs.delete(placeholderId);
         }
       }
     } else {

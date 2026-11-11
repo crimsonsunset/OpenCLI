@@ -1435,6 +1435,7 @@ async function loadBrowserTabGroupingPreference() {
     browserTabGroupingEnabled = true;
   }
 }
+const pendingPlaceholderTabs = /* @__PURE__ */ new Set();
 class CommandFailure extends Error {
   constructor(code, message, hint) {
     super(message);
@@ -1450,8 +1451,14 @@ function setSessionOverride(key, patch) {
 const activeCommandCounts = /* @__PURE__ */ new Map();
 const closingLeases = /* @__PURE__ */ new Set();
 const closingTabs = /* @__PURE__ */ new Set();
+const leaseCloseQueues = /* @__PURE__ */ new Map();
 const closingOwnedRoles = /* @__PURE__ */ new Set();
 const LEASE_KEY_SEPARATOR = "\0";
+function withLeaseClose(leaseKey, fn) {
+  const run = (leaseCloseQueues.get(leaseKey) ?? Promise.resolve()).then(fn, fn);
+  leaseCloseQueues.set(leaseKey, run.then(() => void 0, () => void 0));
+  return run;
+}
 function getLeaseKey(session, surface) {
   return `${surface}${LEASE_KEY_SEPARATOR}${encodeURIComponent(session)}`;
 }
@@ -1758,6 +1765,7 @@ async function collectOwnedGroupCandidates(role) {
   }
   if (groupsById.size === 0) {
     const reservedTabs = new Set([...automationSessions.values()].flatMap((session) => session.preferredTabId === null ? [] : [session.preferredTabId]));
+    pendingPlaceholderTabs.forEach((tabId) => reservedTabs.add(tabId));
     const idleGroup = await findIdleInteractiveGroup(reservedTabs);
     if (idleGroup) groupsById.set(idleGroup.id, idleGroup);
   }
@@ -2024,6 +2032,7 @@ async function findReusableOwnedContainerTab(windowId, ownedGroupId) {
 function initialTabIsAvailable(tabId) {
   if (tabId === void 0) return false;
   if (isTabPoisoned(tabId)) return false;
+  if (pendingPlaceholderTabs.has(tabId)) return false;
   for (const session of automationSessions.values()) {
     if (session.owned && session.preferredTabId === tabId) return false;
   }
@@ -3008,7 +3017,7 @@ function stripOpenCliFrameRoutingParams(params, stripFrameId) {
 }
 async function handleCloseWindow(cmd, leaseKey) {
   if (cmd.action === "close-owned-tab") {
-    return withLeaseMutation(async () => {
+    return withLeaseClose(leaseKey, () => withLeaseMutation(async () => {
       if ((activeCommandCounts.get(leaseKey) ?? 0) > 1) {
         throw new CommandFailure("session_busy", "Cannot close a tab while another command is using this session.");
       }
@@ -3042,11 +3051,18 @@ async function handleCloseWindow(cmd, leaseKey) {
         closingLeases.delete(leaseKey);
         if (closingTabId !== void 0) closingTabs.delete(closingTabId);
       }
-    });
+    }));
   }
-  const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
-  await releaseLease(leaseKey, "explicit close");
-  return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
+  return withLeaseClose(leaseKey, async () => {
+    closingLeases.add(leaseKey);
+    try {
+      const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
+      await releaseLease(leaseKey, "explicit close", true);
+      return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
+    } finally {
+      closingLeases.delete(leaseKey);
+    }
+  });
 }
 let ownedWindowCloseTimeoutMs = 5e3;
 async function handleCloseOwnedWindows(cmd) {
@@ -3239,7 +3255,7 @@ async function handleWaitDownload(cmd) {
     return errorResult(cmd.id, err);
   }
 }
-async function releaseLease(leaseKey, reason = "released") {
+async function releaseLease(leaseKey, reason = "released", replaceTab = false) {
   const session = automationSessions.get(leaseKey);
   if (!session) {
     sessionOverrides.delete(leaseKey);
@@ -3262,17 +3278,34 @@ async function releaseLease(leaseKey, reason = "released") {
         });
         console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
       } else {
+        let placeholderId = tabId;
         try {
           const role = getOwnedWindowRole(leaseKey);
           const idleUrl = role === "interactive" ? await parkIdleInteractiveTab(tabId, session.windowId) : null;
-          const tab = await chrome.tabs.update(tabId, { url: idleUrl ?? BLANK_PAGE, active: true });
-          const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), session.windowId, [tab.id ?? tabId]);
+          const placeholderUrl = idleUrl ?? BLANK_PAGE;
+          if (replaceTab) {
+            placeholderId = (await chrome.tabs.create({ windowId: session.windowId, url: placeholderUrl, active: true })).id ?? tabId;
+            pendingPlaceholderTabs.add(placeholderId);
+          } else {
+            placeholderId = (await chrome.tabs.update(tabId, { url: placeholderUrl, active: true })).id ?? tabId;
+          }
+          const group = await ensureOwnedContainerGroup(role, session.windowId, [placeholderId]);
+          if (placeholderId !== tabId) await chrome.tabs.remove(tabId);
           if (group) session.windowId = group.windowId;
           console.log(`[opencli] Released owned tab lease ${tabId} as reusable placeholder (session=${session.session}, surface=${session.surface}, ${reason})`);
-        } catch {
-          await chrome.tabs.remove(tabId).catch(() => {
-          });
+        } catch (err) {
+          const isUsedTabGone = await chrome.tabs.remove(tabId).then(
+            () => true,
+            () => chrome.tabs.get(tabId).then(() => false, () => true)
+          );
+          if (replaceTab && !isUsedTabGone) {
+            if (placeholderId !== tabId) await chrome.tabs.remove(placeholderId).catch(() => {
+            });
+            throw new Error(`Failed to remove owned tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
           console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
+        } finally {
+          pendingPlaceholderTabs.delete(placeholderId);
         }
       }
     } else {
