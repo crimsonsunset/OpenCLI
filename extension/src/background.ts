@@ -397,7 +397,23 @@ function setSessionOverride(key: string, patch: SessionOverrides): void {
 const activeCommandCounts = new Map<string, number>();
 const closingLeases = new Set<string>();
 const closingTabs = new Set<number>();
+/** Per-lease queue so concurrent close-window/close-owned-tab can't interleave. */
+const leaseCloseQueues = new Map<string, Promise<unknown>>();
 const LEASE_KEY_SEPARATOR = '\u0000';
+
+/**
+ * Serialize close work for one lease without blocking other leases' mutations
+ * (e.g. another session claiming a tab while this close's used-tab remove is pending).
+ *
+ * @param leaseKey - Lease whose close operations must not overlap.
+ * @param fn - Close body to run.
+ * @returns Result of `fn`.
+ */
+function withLeaseClose<T>(leaseKey: string, fn: () => Promise<T>): Promise<T> {
+  const run = (leaseCloseQueues.get(leaseKey) ?? Promise.resolve()).then(fn, fn);
+  leaseCloseQueues.set(leaseKey, run.then(() => undefined, () => undefined));
+  return run;
+}
 
 function getLeaseKey(session: string, surface: BrowserSurface): string {
   return `${surface}${LEASE_KEY_SEPARATOR}${encodeURIComponent(session)}`;
@@ -2329,6 +2345,8 @@ function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFr
 /**
  * Close a session. `close-owned-tab` removes only the lease's own tab; plain
  * close swaps the used page for a placeholder so a beforeunload guard can't block it.
+ * Both paths reserve the lease for the full close and serialize per-lease so concurrent
+ * closes cannot create competing placeholders.
  *
  * @param cmd - Incoming close-window or close-owned-tab command.
  * @param leaseKey - Lease being closed.
@@ -2336,7 +2354,7 @@ function stripOpenCliFrameRoutingParams(params: Record<string, unknown>, stripFr
  */
 async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result> {
   if (cmd.action === 'close-owned-tab') {
-    return withLeaseMutation(async () => {
+    return withLeaseClose(leaseKey, () => withLeaseMutation(async () => {
       if ((activeCommandCounts.get(leaseKey) ?? 0) > 1) {
         throw new CommandFailure('session_busy', 'Cannot close a tab while another command is using this session.');
       }
@@ -2374,21 +2392,22 @@ async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result
         closingLeases.delete(leaseKey);
         if (closingTabId !== undefined) closingTabs.delete(closingTabId);
       }
-    });
+    }));
   }
-  // Two concurrent closes would each create a placeholder; one could survive and
-  // break single-tab idle recovery. Hold the lease for the whole swap.
-  if (closingLeases.has(leaseKey)) {
-    throw new CommandFailure('session_busy', 'This session is already closing; retry after cleanup finishes.');
-  }
-  closingLeases.add(leaseKey);
-  try {
-    const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
-    await releaseLease(leaseKey, 'explicit close', true);
-    return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
-  } finally {
-    closingLeases.delete(leaseKey);
-  }
+  // Per-lease close queue (not the global mutation lock): another session can still
+  // create tabs while used-tab removal is pending; closingLeases + pendingPlaceholderTabs
+  // keep that session off this lease's placeholder. closingLeases alone is racy when two
+  // closes both pass the empty check before either adds.
+  return withLeaseClose(leaseKey, async () => {
+    closingLeases.add(leaseKey);
+    try {
+      const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
+      await releaseLease(leaseKey, 'explicit close', true);
+      return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
+    } finally {
+      closingLeases.delete(leaseKey);
+    }
+  });
 }
 
 async function handleSetFileInput(cmd: Command, leaseKey: string): Promise<Result> {
