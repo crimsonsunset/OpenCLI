@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { consumeIdlePlaceholder, findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab } from './idle-container';
+import {
+  clearIdlePlaceholderForWindow,
+  consumeIdlePlaceholder,
+  findIdleInteractiveGroup,
+  idlePlaceholderUrl,
+  parkIdleInteractiveTab,
+} from './idle-container';
 const KEY = 'opencli_idle_interactive_v1';
 const token = '00000000-0000-4000-8000-000000000001';
 const marker = `chrome-extension://opencli/idle.html#${token}`;
@@ -77,5 +83,11 @@ describe('idle container ownership', () => {
   it('propagates storage failures instead of inventing ownership', async () => {
     chromeMock.storage.local.get.mockRejectedValue(new Error('storage unavailable'));
     await expect(findIdleInteractiveGroup(new Set())).rejects.toThrow('storage unavailable');
+  });
+  it('clears the recovery token only when the abandoned window hosts it', async () => {
+    await clearIdlePlaceholderForWindow(8);
+    expect(storage[KEY]).toBe(token);
+    await clearIdlePlaceholderForWindow(7);
+    expect(storage[KEY]).toBeUndefined();
   });
 });

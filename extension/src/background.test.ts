@@ -3055,6 +3055,66 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('next'))).toEqual(expect.objectContaining({ windowId: 5 }));
   });
 
+  it('keeps the automation window when an active interactive tab was moved into it', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 1, url: 'https://session.example', title: 'session', active: false, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 1, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    await mod.__test__.resolveTabId(undefined, adapterKey('first'));
+    mod.__test__.setSession(browserKey('work'), { windowId: 1, owned: true, preferredTabId: 70 });
+    mod.__test__.setActiveCommandCount(browserKey('work'), 1);
+
+    const result = await mod.__test__.handleCommand({ id: 'close-moved-busy', action: 'close-owned-windows' });
+
+    expect((result.data as any).kept).toEqual(
+      expect.arrayContaining([{ role: 'automation', windowId: 1, reason: 'busy' }]),
+    );
+    expect(chrome.windows.remove).not.toHaveBeenCalled();
+    expect(tabs.some((tab) => tab.id === 70)).toBe(true);
+    expect(mod.__test__.getSession(browserKey('work'))).not.toBeNull();
+  });
+
+  it('abandons a blocked interactive idle window so the next command opens a fresh one', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    const token = '00000000-0000-4000-8000-000000000099';
+    const url = `chrome-extension://opencli/idle.html#${token}`;
+    // Sole placeholder in its own window; default automation tabs stay in window 1.
+    tabs.push({ id: 70, windowId: 7, url, title: 'idle', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    await chrome.storage.local.set({ opencli_idle_interactive_v1: token });
+    await chrome.storage.session.set({
+      [REGISTRY_KEY]: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: { interactive: { windowId: 7, groupIds: [400] }, automation: { windowId: null } },
+        leases: {},
+      },
+    });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setOwnedWindowCloseTimeoutMs(50);
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    expect(mod.__test__.getInteractiveContainer().windowId).toBe(7);
+
+    const result = await mod.__test__.handleCommand({ id: 'close-idle-blocked', action: 'close-owned-windows' });
+    expect((result.data as any).kept).toEqual(
+      expect.arrayContaining([{ role: 'interactive', windowId: 7, reason: 'close_blocked' }]),
+    );
+    expect((await chrome.storage.local.get('opencli_idle_interactive_v1')).opencli_idle_interactive_v1).toBeUndefined();
+    expect(mod.__test__.getInteractiveContainer().windowId).toBeNull();
+
+    chrome.windows.create.mockResolvedValueOnce({ id: 9, focused: false } as any);
+    chrome.tabs.query.mockClear();
+    await mod.__test__.resolveTabId(undefined, browserKey('next'), 'https://fresh.example');
+
+    expect(chrome.windows.create).toHaveBeenCalled();
+    expect(mod.__test__.getSession(browserKey('next'))).toEqual(expect.objectContaining({ windowId: 9 }));
+    expect(tabs.find((tab) => tab.id === 70)?.url).toBe(url);
+  });
+
   it('keeps the lease of a browser-session tab whose group moved before its old window closed', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({ id: 70, windowId: 7, url: 'https://session.example', title: 'session', active: true, status: 'complete', groupId: 400 });

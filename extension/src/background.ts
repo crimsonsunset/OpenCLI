@@ -10,7 +10,13 @@ declare const __OPENCLI_COMPAT_RANGE__: string;
 import { callChrome, describeChrome, ChromeApiError } from './chrome-api';
 import type { Command, Result } from './protocol';
 import { DAEMON_HOST, DAEMON_PORT, DAEMON_WS_URL, DAEMON_PING_URL } from './protocol';
-import { findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab, consumeIdlePlaceholder } from './idle-container';
+import {
+  findIdleInteractiveGroup,
+  idlePlaceholderUrl,
+  parkIdleInteractiveTab,
+  consumeIdlePlaceholder,
+  clearIdlePlaceholderForWindow,
+} from './idle-container';
 import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
@@ -2470,6 +2476,12 @@ async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
           report.kept.push({ role, windowId, reason: 'user_tabs', closedTabs });
           continue;
         }
+        // Role-based busy checks miss a command whose tab the user dragged into
+        // this window from the other owned surface. Re-check by live membership.
+        if (await windowHasActiveCommandTabs(windowId)) {
+          report.kept.push({ role, windowId, reason: 'busy' });
+          continue;
+        }
         // `chrome.windows.remove` resolving is not proof: Edge kept answering
         // `windows.get` for a few hundred ms after a window it had closed
         // (measured 2026-09-17, which made every normal close report as blocked).
@@ -2517,8 +2529,9 @@ async function retireInteractiveGroupOwnership(
  * Give up ownership of a window whose close is stuck on a "Leave site?" prompt.
  * The prompt can resolve at any time or never, so instead of reserving the role
  * until an outcome Chrome can't report, drop the container pointer, group ledger
- * entry, and leases. The next command opens a fresh container; if the user picks
- * Stay, the window stays open as theirs.
+ * entry, leases, and any idle-placeholder recovery token still pointing at this
+ * window. The next command opens a fresh container; if the user picks Stay, the
+ * window stays open as theirs.
  * @param role - Owned surface whose container is being abandoned
  * @param windowId - Window still waiting on its close prompt
  */
@@ -2526,8 +2539,24 @@ async function abandonOwnedWindow(role: OwnedWindowRole, windowId: number): Prom
   if (role === 'interactive') {
     await retireInteractiveGroupOwnership(ownedContainers.interactive.groupId, []);
     ownedContainers.interactive.groupId = null;
+    await clearIdlePlaceholderForWindow(windowId);
   }
   await forgetClosedWindow(windowId);
+}
+
+/**
+ * Whether any in-flight command currently owns a tab living in `windowId`.
+ * Role-scoped busy checks miss tabs the user dragged across owned surfaces.
+ * @param windowId - Window about to be removed wholesale
+ */
+async function windowHasActiveCommandTabs(windowId: number): Promise<boolean> {
+  for (const leaseKey of activeCommandCounts.keys()) {
+    const session = automationSessions.get(leaseKey);
+    if (session?.preferredTabId === null || session?.preferredTabId === undefined) continue;
+    const tab = await chrome.tabs.get(session.preferredTabId).catch(() => null);
+    if (tab?.windowId === windowId) return true;
+  }
+  return false;
 }
 
 /**

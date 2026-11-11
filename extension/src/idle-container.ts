@@ -28,6 +28,19 @@ export async function consumeIdlePlaceholder(tab: chrome.tabs.Tab): Promise<void
   }
 }
 
+/**
+ * Drop the recovery token when `windowId` still hosts the current idle
+ * placeholder, so a close-stuck abandoned window cannot be re-adopted.
+ * @param windowId - Window being abandoned after a blocked close
+ */
+export async function clearIdlePlaceholderForWindow(windowId: number): Promise<void> {
+  const url = await idlePlaceholderUrl();
+  if (!url) return;
+  const tabs = await chrome.tabs.query({ windowId });
+  if (!tabs.some((tab) => tab.url === url)) return;
+  await chrome.storage.local.remove(KEY);
+}
+
 export async function findIdleInteractiveGroup(reservedTabs: Set<number>): Promise<chrome.tabGroups.TabGroup | null> {
   const url = await idlePlaceholderUrl();
   if (!url) return null;
