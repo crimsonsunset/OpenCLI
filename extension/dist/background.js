@@ -2112,10 +2112,10 @@ async function forgetClosedWindow(windowId) {
     }
   }
   for (const [leaseKey, session] of automationSessions.entries()) {
-    if (session.windowId !== windowId) continue;
     const liveTab = session.preferredTabId === null ? null : await chrome.tabs.get(session.preferredTabId).catch(() => null);
-    if (liveTab && liveTab.windowId !== windowId) {
-      session.windowId = liveTab.windowId;
+    const liveWindowId = liveTab?.windowId ?? session.windowId;
+    if (liveWindowId !== windowId) {
+      session.windowId = liveWindowId;
       continue;
     }
     console.log(`[opencli] ${session.surface} container closed (session=${session.session})`);

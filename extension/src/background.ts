@@ -1326,11 +1326,12 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
 });
 
 /**
- * Drop every container pointer and lease that lived in a window that is gone.
- * A user can drag the browser-session group to another window before closing
- * the old one, so a group or leased tab still alive elsewhere is re-pointed at
- * its live window instead of being forgotten.
- * @param windowId - Window that was closed
+ * Drop every container pointer and lease that lives in a window that is gone
+ * or being abandoned. Leases are matched by their tab's live window, not just
+ * the cached windowId: a group or tab dragged out of this window is re-pointed
+ * at its live window, and a tab dragged into it (stale cache elsewhere) is
+ * dropped so no later command reuses a window stuck closing.
+ * @param windowId - Window that was closed or abandoned
  */
 async function forgetClosedWindow(windowId: number): Promise<void> {
   for (const role of ['automation', 'interactive'] as const) {
@@ -1345,12 +1346,12 @@ async function forgetClosedWindow(windowId: number): Promise<void> {
     }
   }
   for (const [leaseKey, session] of automationSessions.entries()) {
-    if (session.windowId !== windowId) continue;
     const liveTab = session.preferredTabId === null
       ? null
       : await chrome.tabs.get(session.preferredTabId).catch(() => null);
-    if (liveTab && liveTab.windowId !== windowId) {
-      session.windowId = liveTab.windowId;
+    const liveWindowId = liveTab?.windowId ?? session.windowId;
+    if (liveWindowId !== windowId) {
+      session.windowId = liveWindowId;
       continue;
     }
     console.log(`[opencli] ${session.surface} container closed (session=${session.session})`);

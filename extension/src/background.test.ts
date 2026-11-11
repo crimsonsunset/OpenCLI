@@ -3055,6 +3055,25 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('next'))).toEqual(expect.objectContaining({ windowId: 5 }));
   });
 
+  it('drops a lease whose tab was moved into an abandoned window despite a stale cached window id', async () => {
+    const { chrome, tabs } = createChromeMock();
+    tabs.push({ id: 70, windowId: 1, url: 'https://session.example', title: 'session', active: false, status: 'complete' });
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setOwnedWindowCloseTimeoutMs(50);
+    await mod.__test__.resolveTabId(undefined, adapterKey('first'));
+    // Tab 70 was dragged into automation window 1; the lease still caches window 7.
+    mod.__test__.setSession(browserKey('work'), { windowId: 7, owned: true, preferredTabId: 70 });
+
+    const result = await mod.__test__.handleCommand({ id: 'close-moved-in', action: 'close-owned-windows' });
+
+    expect((result.data as any).kept).toEqual(
+      expect.arrayContaining([{ role: 'automation', windowId: 1, reason: 'close_blocked' }]),
+    );
+    expect(mod.__test__.getSession(browserKey('work'))).toBeNull();
+  });
+
   it('keeps the automation window when an active interactive tab was moved into it', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({ id: 70, windowId: 1, url: 'https://session.example', title: 'session', active: false, status: 'complete', groupId: 400 });
