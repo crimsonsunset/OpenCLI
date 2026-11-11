@@ -517,10 +517,31 @@ async function evaluateViaUserScripts(
   });
   const injection = results?.[0];
   if (injection?.error) {
-    throw new Error(String(injection.error));
+    // Code reached the page world — may have written before throwing.
+    throwExecutionStarted(String(injection.error));
   }
   console.log(`[opencli:eval] userScripts fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
   return injection?.result;
+}
+
+/**
+ * Throw an error flagged so fallbacks do not replay the expression.
+ * @param message - Underlying eval / injection error
+ */
+function throwExecutionStarted(message: string): never {
+  const err = new Error(message) as Error & { executionStarted: true };
+  err.executionStarted = true;
+  throw err;
+}
+
+/**
+ * Whether a fallback error means the expression may already have run.
+ * @param err - Error from a scripting / userScripts world
+ */
+function hasEvalExecutionStarted(err: unknown): boolean {
+  return typeof err === 'object'
+    && err !== null
+    && (err as { executionStarted?: boolean }).executionStarted === true;
 }
 
 /**
@@ -540,27 +561,43 @@ async function evaluateViaScriptingWorld(
     world,
     args: [expression],
     func: async (code: string) => {
+      // Compile a thunk first so page CSP (eval blocked) is distinguishable from
+      // an expression that runs, writes, then `throw new EvalError(...)`.
+      let run: () => unknown;
       try {
         // eslint-disable-next-line no-eval
-        const value = await (0, eval)(code);
+        run = (0, eval)(`(() => (0, eval)(${JSON.stringify(code)}))`) as () => unknown;
+      } catch (err) {
+        return {
+          __opencli: true,
+          ok: false as const,
+          isBlocked: true,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      try {
+        const value = await run();
         return { __opencli: true, ok: true as const, value };
       } catch (err) {
         return {
           __opencli: true,
           ok: false as const,
+          isBlocked: false,
           error: err instanceof Error ? err.message : String(err),
         };
       }
     },
   });
   const wrapped = injection?.result as
-    | { __opencli?: boolean; ok?: boolean; value?: unknown; error?: string }
+    | { __opencli?: boolean; ok?: boolean; isBlocked?: boolean; value?: unknown; error?: string }
     | undefined;
   if (!wrapped || wrapped.__opencli !== true) {
     throw new Error('scripting fallback returned no result (likely CSP-blocked eval)');
   }
   if (!wrapped.ok) {
-    throw new Error(wrapped.error || 'scripting fallback eval failed');
+    const message = wrapped.error || 'scripting fallback eval failed';
+    if (wrapped.isBlocked) throw new Error(message);
+    throwExecutionStarted(message);
   }
   return wrapped.value;
 }
@@ -580,6 +617,7 @@ function isPreEvalAttachFailure(message: string): boolean {
  * Evaluate via scripting MAIN → userScripts → scripting ISOLATED.
  * MAIN matches Runtime.evaluate's page world when CSP allows; USER_SCRIPT is
  * the MV3-legal arbitrary-code path for Amazon /dp; ISOLATED is last resort.
+ * Never replay across worlds once a world may have started the expression.
  * @param tabId - Chrome tab id
  * @param expression - JS source CDP would have received
  * @param startedAt - Outer evaluate start time for log offsets
@@ -600,6 +638,8 @@ async function evaluateViaFallbacks(
     } catch (scriptErr) {
       const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
       console.warn(`[opencli:eval] scripting MAIN fallback failed tab=${tabId}: ${scriptMsg}`);
+      // Expression may have written then thrown — do not replay in userScripts.
+      if (hasEvalExecutionStarted(scriptErr)) throw scriptErr;
     }
   }
 
@@ -608,6 +648,7 @@ async function evaluateViaFallbacks(
   } catch (userScriptErr) {
     const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
     console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+    if (hasEvalExecutionStarted(userScriptErr)) throw userScriptErr;
   }
 
   if (hasScripting) {
