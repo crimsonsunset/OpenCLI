@@ -2412,6 +2412,7 @@ async function handleWaitDownload(cmd: Command): Promise<Result> {
  * @param reason - Log label for why the lease ended.
  * @param replaceTab - Swap the used page for a fresh placeholder tab instead of navigating it,
  *   so the page's beforeunload guard can't block teardown. Used for explicit close.
+ * @throws When `replaceTab` is set and the used page can't be removed; the lease is kept for retry.
  */
 async function releaseLease(leaseKey: string, reason: string = 'released', replaceTab = false): Promise<void> {
   const session = automationSessions.get(leaseKey);
@@ -2458,8 +2459,15 @@ async function releaseLease(leaseKey: string, reason: string = 'released', repla
           if (placeholderId !== tabId) await chrome.tabs.remove(tabId);
           if (group) session.windowId = group.windowId;
           console.log(`[opencli] Released owned tab lease ${tabId} as reusable placeholder (session=${session.session}, surface=${session.surface}, ${reason})`);
-        } catch {
-          await chrome.tabs.remove(tabId).catch(() => {});
+        } catch (err) {
+          const isUsedTabGone = await chrome.tabs.remove(tabId).then(
+            () => true,
+            () => chrome.tabs.get(tabId).then(() => false, () => true),
+          );
+          // Explicit close keeps the lease when the used page survives, so the caller can retry.
+          if (replaceTab && !isUsedTabGone) {
+            throw new Error(`Failed to remove owned tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`);
+          }
           console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
         }
       }

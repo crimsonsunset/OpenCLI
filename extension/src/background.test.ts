@@ -1524,6 +1524,19 @@ describe('background tab isolation', () => {
     expect(chrome.windows.remove).not.toHaveBeenCalled();
   });
 
+  it('keeps the lease when explicit close cannot remove the used page', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    await mod.__test__.resolveTabId(undefined, adapterKey('stuck'));
+    chrome.tabs.remove.mockRejectedValue(new Error('Tab is locked'));
+
+    const result = await mod.__test__.handleCommand({ id: 'close-stuck', action: 'close-window', session: 'stuck', surface: 'adapter' });
+    expect(result).toEqual(expect.objectContaining({ ok: false }));
+    expect(mod.__test__.getSession(adapterKey('stuck'))).toEqual(expect.objectContaining({ preferredTabId: 1 }));
+  });
+
   it('opts into closing only the owned tab, preserving user pages and other sessions', async () => {
     const { chrome, tabs } = createChromeMock();
     vi.stubGlobal('chrome', chrome);
