@@ -469,9 +469,25 @@ async function evaluateViaUserScripts(tabId, expression, startedAt) {
 		injectImmediately: true,
 		js: [{ code: expression }]
 	}))?.[0];
-	if (injection?.error) throw new Error(String(injection.error));
+	if (injection?.error) throwExecutionStarted(String(injection.error));
 	console.log(`[opencli:eval] userScripts fallback ok tab=${tabId} t+${Date.now() - startedAt}ms`);
 	return injection?.result;
+}
+/**
+* Throw an error flagged so fallbacks do not replay the expression.
+* @param message - Underlying eval / injection error
+*/
+function throwExecutionStarted(message) {
+	const err = new Error(message);
+	err.executionStarted = true;
+	throw err;
+}
+/**
+* Whether a fallback error means the expression may already have run.
+* @param err - Error from a scripting / userScripts world
+*/
+function hasEvalExecutionStarted(err) {
+	return typeof err === "object" && err !== null && err.executionStarted === true;
 }
 /**
 * chrome.scripting path with explicit ok/error envelope so CSP-blocked eval
@@ -486,16 +502,28 @@ async function evaluateViaScriptingWorld(tabId, expression, world) {
 		world,
 		args: [expression],
 		func: async (code) => {
+			let run;
+			try {
+				run = (0, eval)(`(() => (0, eval)(${JSON.stringify(code)}))`);
+			} catch (err) {
+				return {
+					__opencli: true,
+					ok: false,
+					isBlocked: true,
+					error: err instanceof Error ? err.message : String(err)
+				};
+			}
 			try {
 				return {
 					__opencli: true,
 					ok: true,
-					value: await (0, eval)(code)
+					value: await run()
 				};
 			} catch (err) {
 				return {
 					__opencli: true,
 					ok: false,
+					isBlocked: false,
 					error: err instanceof Error ? err.message : String(err)
 				};
 			}
@@ -503,7 +531,11 @@ async function evaluateViaScriptingWorld(tabId, expression, world) {
 	});
 	const wrapped = injection?.result;
 	if (!wrapped || wrapped.__opencli !== true) throw new Error("scripting fallback returned no result (likely CSP-blocked eval)");
-	if (!wrapped.ok) throw new Error(wrapped.error || "scripting fallback eval failed");
+	if (!wrapped.ok) {
+		const message = wrapped.error || "scripting fallback eval failed";
+		if (wrapped.isBlocked) throw new Error(message);
+		throwExecutionStarted(message);
+	}
 	return wrapped.value;
 }
 /**
@@ -519,6 +551,7 @@ function isPreEvalAttachFailure(message) {
 * Evaluate via scripting MAIN → userScripts → scripting ISOLATED.
 * MAIN matches Runtime.evaluate's page world when CSP allows; USER_SCRIPT is
 * the MV3-legal arbitrary-code path for Amazon /dp; ISOLATED is last resort.
+* Never replay across worlds once a world may have started the expression.
 * @param tabId - Chrome tab id
 * @param expression - JS source CDP would have received
 * @param startedAt - Outer evaluate start time for log offsets
@@ -534,12 +567,14 @@ async function evaluateViaFallbacks(tabId, expression, startedAt) {
 	} catch (scriptErr) {
 		const scriptMsg = scriptErr instanceof Error ? scriptErr.message : String(scriptErr);
 		console.warn(`[opencli:eval] scripting MAIN fallback failed tab=${tabId}: ${scriptMsg}`);
+		if (hasEvalExecutionStarted(scriptErr)) throw scriptErr;
 	}
 	try {
 		return await evaluateViaUserScripts(tabId, expression, startedAt);
 	} catch (userScriptErr) {
 		const userScriptMsg = userScriptErr instanceof Error ? userScriptErr.message : String(userScriptErr);
 		console.warn(`[opencli:eval] userScripts fallback failed tab=${tabId}: ${userScriptMsg}`);
+		if (hasEvalExecutionStarted(userScriptErr)) throw userScriptErr;
 	}
 	if (hasScripting) try {
 		console.warn(`[opencli:eval] scripting ISOLATED fallback begin tab=${tabId}`);
@@ -1605,15 +1640,20 @@ function getSessionFromKey(key) {
 		return key.slice(idx + 1);
 	}
 }
+/** Adapter sites that need the aggressive attach profile and its non-CDP eval fallback. */
+var AGGRESSIVE_ATTACH_SITES = ["amazon", "ticketmaster"];
 /**
 * Whether CDP attach should use the aggressive retry profile (5×1500ms).
-* Browser-surface commands always do. Amazon adapter sessions also do —
-* `/dp` navigations routinely outlast the weak adapter profile (2×500ms).
+* Browser-surface commands always do. Some adapter sites also do: Amazon `/dp`
+* navigations outlast the weak profile (2×500ms), and Ticketmaster pages often
+* carry foreign chrome-extension:// frames that block attach outright.
+* @param leaseKey - Surface-prefixed session lease key
+* @returns True when the aggressive profile (and eval fallbacks) apply
 */
 function shouldUseAggressiveAttach(leaseKey) {
 	if (getSurfaceFromKey(leaseKey) === "browser") return true;
 	const session = getSessionFromKey(leaseKey);
-	return session === "site:amazon" || session.startsWith("site:amazon:");
+	return AGGRESSIVE_ATTACH_SITES.some((site) => session === `site:${site}` || session.startsWith(`site:${site}:`));
 }
 function getIdleTimeout(key) {
 	const session = automationSessions.get(key);

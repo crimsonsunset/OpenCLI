@@ -675,6 +675,7 @@ describe('background tab isolation', () => {
     const mod = await import('./background');
     expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:amazon:abc'))).toBe(true);
     expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:amazon'))).toBe(true);
+    expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:ticketmaster:abc'))).toBe(true);
     expect(mod.__test__.shouldUseAggressiveAttach(adapterKey('site:twitter:abc'))).toBe(false);
     expect(mod.__test__.shouldUseAggressiveAttach(browserKey('main'))).toBe(true);
 
