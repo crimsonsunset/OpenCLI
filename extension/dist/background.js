@@ -1605,15 +1605,20 @@ function getSessionFromKey(key) {
 		return key.slice(idx + 1);
 	}
 }
+/** Adapter sites that need the aggressive attach profile and its non-CDP eval fallback. */
+var AGGRESSIVE_ATTACH_SITES = ["amazon", "ticketmaster"];
 /**
 * Whether CDP attach should use the aggressive retry profile (5×1500ms).
-* Browser-surface commands always do. Amazon adapter sessions also do —
-* `/dp` navigations routinely outlast the weak adapter profile (2×500ms).
+* Browser-surface commands always do. Some adapter sites also do: Amazon `/dp`
+* navigations outlast the weak profile (2×500ms), and Ticketmaster pages often
+* carry foreign chrome-extension:// frames that block attach outright.
+* @param leaseKey - Surface-prefixed session lease key
+* @returns True when the aggressive profile (and eval fallbacks) apply
 */
 function shouldUseAggressiveAttach(leaseKey) {
 	if (getSurfaceFromKey(leaseKey) === "browser") return true;
 	const session = getSessionFromKey(leaseKey);
-	return session === "site:amazon" || session.startsWith("site:amazon:");
+	return AGGRESSIVE_ATTACH_SITES.some((site) => session === `site:${site}` || session.startsWith(`site:${site}:`));
 }
 function getIdleTimeout(key) {
 	const session = automationSessions.get(key);
