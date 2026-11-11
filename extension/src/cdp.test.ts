@@ -751,3 +751,56 @@ describe('cdp command deadline', () => {
     await assertion;
   });
 });
+
+describe('eval fallbacks after attach failure', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * Stub a tab whose CDP attach always fails, with MAIN-world eval returning `mainResult`.
+   * @param mainResult - Envelope the scripting MAIN eval returns
+   */
+  function stubBlockedAttach(mainResult: object) {
+    const { chrome } = createChromeMock();
+    chrome.tabs.get = vi.fn(async () => ({ id: 1, windowId: 1, url: 'https://www.ticketmaster.com/', status: 'complete' }));
+    chrome.debugger.attach = vi.fn(async () => {
+      throw new Error('Cannot access a chrome-extension:// URL of different extension');
+    });
+    const execute = vi.fn(async () => [{ result: 'from-user-script' }]);
+    const executeScript = vi.fn(async (opts: { world?: string }) => (
+      opts.world === 'MAIN' ? [{ result: mainResult }] : [{ result: { removed: 0 } }]
+    ));
+    vi.stubGlobal('chrome', {
+      ...chrome,
+      scripting: { executeScript },
+      tabs: { ...chrome.tabs, sendMessage: vi.fn(async () => ({ removed: 0 })) },
+      userScripts: { execute },
+    });
+    return { execute };
+  }
+
+  it('falls through to userScripts when MAIN eval is CSP-blocked, but never replays a runtime throw', async () => {
+    vi.useFakeTimers();
+    const blocked = stubBlockedAttach({ __opencli: true, ok: false, isBlocked: true, error: 'unsafe-eval' });
+    let mod = await import('./cdp');
+    let pending = mod.evaluate(1, 'doThing()', true);
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toBe('from-user-script');
+    expect(blocked.execute).toHaveBeenCalledTimes(1);
+
+    vi.resetModules();
+    const threw = stubBlockedAttach({ __opencli: true, ok: false, isBlocked: false, error: 'boom' });
+    mod = await import('./cdp');
+    pending = mod.evaluate(1, 'doThing()', true);
+    const assertion = expect(pending).rejects.toThrow();
+    await vi.runAllTimersAsync();
+    await assertion;
+    expect(threw.execute).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+});

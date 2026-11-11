@@ -525,13 +525,6 @@ async function evaluateViaUserScripts(
 }
 
 /**
- * chrome.scripting path with explicit ok/error envelope so CSP-blocked eval
- * cannot silently return null (which crashed amazon readPageState on .href).
- * @param tabId - Chrome tab id
- * @param expression - JS source
- * @param world - Execution world
- */
-/**
  * Throw an error flagged so fallbacks do not replay the expression.
  * @param message - Underlying eval / injection error
  */
@@ -576,19 +569,23 @@ async function evaluateViaScriptingWorld(
         return {
           __opencli: true,
           ok: false as const,
+          // CSP-blocked eval throws EvalError before any of the code runs.
+          isBlocked: err instanceof EvalError,
           error: err instanceof Error ? err.message : String(err),
         };
       }
     },
   });
   const wrapped = injection?.result as
-    | { __opencli?: boolean; ok?: boolean; value?: unknown; error?: string }
+    | { __opencli?: boolean; ok?: boolean; isBlocked?: boolean; value?: unknown; error?: string }
     | undefined;
   if (!wrapped || wrapped.__opencli !== true) {
     throw new Error('scripting fallback returned no result (likely CSP-blocked eval)');
   }
   if (!wrapped.ok) {
-    throwExecutionStarted(wrapped.error || 'scripting fallback eval failed');
+    const message = wrapped.error || 'scripting fallback eval failed';
+    if (wrapped.isBlocked) throw new Error(message);
+    throwExecutionStarted(message);
   }
   return wrapped.value;
 }
