@@ -1522,7 +1522,7 @@ async function handleCommand(cmd: Command): Promise<Result> {
   if (closingLeases.has(leaseKey)) {
     return errorResult(cmd.id, new CommandFailure('session_busy', 'This session is closing; retry after cleanup finishes.'));
   }
-  if (closingOwnedRoles.has(getOwnedWindowRole(leaseKey))) {
+  if (closingOwnedRoles.has(getOwnedWindowRole(leaseKey)) && !isBoundOutsideContainer(leaseKey, cmd)) {
     return errorResult(cmd.id, new CommandFailure('session_busy', 'OpenCLI is closing this window; retry after cleanup finishes.'));
   }
   if (cmd.windowMode === 'foreground' || cmd.windowMode === 'background') {
@@ -2428,7 +2428,7 @@ async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
       // this role; withLeaseMutation alone does not cover their full execution.
       closingOwnedRoles.add(role);
       try {
-        if ([...activeCommandCounts.keys()].some((leaseKey) => getOwnedWindowRole(leaseKey) === role)) {
+        if (hasOwnedCommandOnRole(role)) {
           report.kept.push({ role, windowId, reason: 'busy' });
           continue;
         }
@@ -2442,7 +2442,7 @@ async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
         }
         // A command may have started between the first busy check and these
         // lookups; abort before removing anything.
-        if ([...activeCommandCounts.keys()].some((leaseKey) => getOwnedWindowRole(leaseKey) === role)) {
+        if (hasOwnedCommandOnRole(role)) {
           report.kept.push({ role, windowId, reason: 'busy' });
           continue;
         }
@@ -2542,6 +2542,31 @@ async function abandonOwnedWindow(role: OwnedWindowRole, windowId: number): Prom
     await clearIdlePlaceholderForWindow(windowId);
   }
   await forgetClosedWindow(windowId);
+}
+
+/**
+ * Whether a command on this role is running against OpenCLI's own container,
+ * or hasn't resolved its target yet. Borrowed (bound) sessions are skipped;
+ * windowHasActiveCommandTabs still guards any that sit in the window.
+ * @param role - Owned surface being closed
+ */
+function hasOwnedCommandOnRole(role: OwnedWindowRole): boolean {
+  return [...activeCommandCounts.keys()].some((leaseKey) =>
+    getOwnedWindowRole(leaseKey) === role && automationSessions.get(leaseKey)?.kind !== 'bound');
+}
+
+/**
+ * Whether a command targets a borrowed tab outside its role's owned container,
+ * so that container closing can't affect it. Rebinds stay blocked because they
+ * may pick a tab inside the closing window.
+ * @param leaseKey - Lease the command runs on
+ * @param cmd - Incoming command
+ */
+function isBoundOutsideContainer(leaseKey: string, cmd: Command): boolean {
+  if (cmd.action === 'bind') return false;
+  const lease = automationSessions.get(leaseKey);
+  if (lease?.kind !== 'bound') return false;
+  return lease.windowId !== ownedContainers[getOwnedWindowRole(leaseKey)].windowId;
 }
 
 /**

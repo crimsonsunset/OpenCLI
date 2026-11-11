@@ -3115,6 +3115,37 @@ describe('background tab isolation', () => {
     expect(tabs.find((tab) => tab.id === 70)?.url).toBe(url);
   });
 
+  it('does not let a borrowed tab in another window hold the browser container open or get blocked', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://session.example', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    const closedWindows = new Set<number>();
+    chrome.windows.get.mockImplementation(async (windowId: number) => {
+      if (closedWindows.has(windowId)) throw new Error(`No window with id: ${windowId}.`);
+      return { id: windowId, type: 'normal', focused: false };
+    });
+    chrome.windows.remove.mockImplementation(async (windowId: number) => { closedWindows.add(windowId); });
+    vi.stubGlobal('chrome', chrome);
+    await chrome.storage.session.set({
+      [REGISTRY_KEY]: {
+        version: 2,
+        contextId: 'user-default',
+        ownedContainers: { interactive: { windowId: 7, groupIds: [400] }, automation: { windowId: null } },
+        leases: {},
+      },
+    });
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('work'), { windowId: 7, owned: true, preferredTabId: 70 });
+    mod.__test__.setSession(browserKey('borrowed'), { windowId: 2, owned: false, preferredTabId: 2 });
+    mod.__test__.setActiveCommandCount(browserKey('borrowed'), 1);
+
+    const result = await mod.__test__.handleCommand({ id: 'close-with-borrowed', action: 'close-owned-windows' });
+
+    expect((result.data as any).closed).toEqual([expect.objectContaining({ role: 'interactive', windowId: 7 })]);
+    expect(mod.__test__.getSession(browserKey('borrowed'))).not.toBeNull();
+  });
+
   it('keeps the lease of a browser-session tab whose group moved before its old window closed', async () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({ id: 70, windowId: 7, url: 'https://session.example', title: 'session', active: true, status: 'complete', groupId: 400 });

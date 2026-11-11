@@ -111,6 +111,13 @@ async function consumeIdlePlaceholder(tab) {
     await chrome.storage.local.remove(KEY);
   }
 }
+async function clearIdlePlaceholderForWindow(windowId) {
+  const url = await idlePlaceholderUrl();
+  if (!url) return;
+  const tabs = await chrome.tabs.query({ windowId });
+  if (!tabs.some((tab) => tab.url === url)) return;
+  await chrome.storage.local.remove(KEY);
+}
 async function findIdleInteractiveGroup(reservedTabs) {
   const url = await idlePlaceholderUrl();
   if (!url) return null;
@@ -2239,7 +2246,7 @@ async function handleCommand(cmd) {
   if (closingLeases.has(leaseKey)) {
     return errorResult(cmd.id, new CommandFailure("session_busy", "This session is closing; retry after cleanup finishes."));
   }
-  if (closingOwnedRoles.has(getOwnedWindowRole(leaseKey))) {
+  if (closingOwnedRoles.has(getOwnedWindowRole(leaseKey)) && !isBoundOutsideContainer(leaseKey, cmd)) {
     return errorResult(cmd.id, new CommandFailure("session_busy", "OpenCLI is closing this window; retry after cleanup finishes."));
   }
   if (cmd.windowMode === "foreground" || cmd.windowMode === "background") {
@@ -2953,7 +2960,7 @@ async function handleCloseOwnedWindows(cmd) {
       if (windowId === null) continue;
       closingOwnedRoles.add(role);
       try {
-        if ([...activeCommandCounts.keys()].some((leaseKey) => getOwnedWindowRole(leaseKey) === role)) {
+        if (hasOwnedCommandOnRole(role)) {
           report.kept.push({ role, windowId, reason: "busy" });
           continue;
         }
@@ -2965,7 +2972,7 @@ async function handleCloseOwnedWindows(cmd) {
           await forgetClosedWindow(windowId);
           continue;
         }
-        if ([...activeCommandCounts.keys()].some((leaseKey) => getOwnedWindowRole(leaseKey) === role)) {
+        if (hasOwnedCommandOnRole(role)) {
           report.kept.push({ role, windowId, reason: "busy" });
           continue;
         }
@@ -2989,6 +2996,10 @@ async function handleCloseOwnedWindows(cmd) {
           container.groupId = null;
           await persistRuntimeState();
           report.kept.push({ role, windowId, reason: "user_tabs", closedTabs });
+          continue;
+        }
+        if (await windowHasActiveCommandTabs(windowId)) {
+          report.kept.push({ role, windowId, reason: "busy" });
           continue;
         }
         void chrome.windows.remove(windowId).catch(() => {
@@ -3021,8 +3032,27 @@ async function abandonOwnedWindow(role, windowId) {
   if (role === "interactive") {
     await retireInteractiveGroupOwnership(ownedContainers.interactive.groupId, []);
     ownedContainers.interactive.groupId = null;
+    await clearIdlePlaceholderForWindow(windowId);
   }
   await forgetClosedWindow(windowId);
+}
+function hasOwnedCommandOnRole(role) {
+  return [...activeCommandCounts.keys()].some((leaseKey) => getOwnedWindowRole(leaseKey) === role && automationSessions.get(leaseKey)?.kind !== "bound");
+}
+function isBoundOutsideContainer(leaseKey, cmd) {
+  if (cmd.action === "bind") return false;
+  const lease = automationSessions.get(leaseKey);
+  if (lease?.kind !== "bound") return false;
+  return lease.windowId !== ownedContainers[getOwnedWindowRole(leaseKey)].windowId;
+}
+async function windowHasActiveCommandTabs(windowId) {
+  for (const leaseKey of activeCommandCounts.keys()) {
+    const session = automationSessions.get(leaseKey);
+    if (session?.preferredTabId === null || session?.preferredTabId === void 0) continue;
+    const tab = await chrome.tabs.get(session.preferredTabId).catch(() => null);
+    if (tab?.windowId === windowId) return true;
+  }
+  return false;
 }
 async function removeOwnedTabsConfirmed(tabIds) {
   if (tabIds.length === 0) return 0;
