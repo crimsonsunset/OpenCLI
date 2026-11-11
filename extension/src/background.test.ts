@@ -796,17 +796,24 @@ describe('background tab isolation', () => {
     const { chrome, tabs, groups } = createChromeMock();
     tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
     groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    chrome.tabs.remove.mockImplementation(async (tabId: number) => {
+      tabs.splice(tabs.findIndex(tab => tab.id === tabId), 1);
+    });
     vi.stubGlobal('chrome', chrome);
     let mod = await import('./background');
     await mod.__test__.reconcileTargetLeaseRegistry();
     mod.__test__.setSession(browserKey('owned'), { windowId: 7, owned: true, preferredTabId: 70 });
     await mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'owned', surface: 'browser' });
-    expect(tabs.find(tab => tab.id === 70)?.url).toMatch(/^chrome-extension:\/\/opencli\/idle.html#/);
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(70, expect.anything());
+    expect(tabs.find(tab => tab.id === 70)).toBeUndefined();
+    const placeholder = tabs.find(tab => tab.windowId === 7);
+    expect(placeholder?.url).toMatch(/^chrome-extension:\/\/opencli\/idle.html#/);
+    expect(placeholder?.groupId).toBe(400);
     await chrome.storage.session.set({ opencli_target_lease_registry_v2: undefined });
     vi.resetModules();
     mod = await import('./background');
     await mod.__test__.reconcileTargetLeaseRegistry();
-    expect(await mod.__test__.resolveTabId(undefined, browserKey('again'), 'https://target.example')).toBe(70);
+    expect(await mod.__test__.resolveTabId(undefined, browserKey('again'), 'https://target.example')).toBe(placeholder?.id);
     expect(chrome.windows.create).not.toHaveBeenCalled();
   });
 
@@ -1511,7 +1518,8 @@ describe('background tab isolation', () => {
     expect(mod.__test__.getSession(adapterKey('second'))).toBeNull();
 
     await mod.__test__.handleCommand({ id: 'close-first', action: 'close-window', session: 'first', surface: 'adapter' });
-    expect(chrome.debugger.detach.mock.calls.at(-1)).toEqual([{ tabId: 1 }]);
+    expect(chrome.tabs.update).not.toHaveBeenCalledWith(1, { url: 'about:blank', active: true });
+    expect(chrome.tabs.create).toHaveBeenLastCalledWith({ windowId: 1, url: 'about:blank', active: true });
     expect(chrome.tabs.remove.mock.calls.at(-1)).toEqual([1]);
     expect(chrome.windows.remove).not.toHaveBeenCalled();
   });

@@ -2341,20 +2341,7 @@ async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result
     });
   }
   const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
-  const session = automationSessions.get(leaseKey);
-  if (session?.owned && session.preferredTabId !== null) {
-    try {
-      await releaseOwnedLeaseForExplicitClose(leaseKey);
-    } catch (err) {
-      return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : 'Failed to clean up the owned tab lease' };
-    }
-    return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
-  }
-  try {
-    await releaseLease(leaseKey, 'explicit close');
-  } catch {
-    return { id: cmd.id, ok: false, error: 'Failed to clean up the owned tab lease' };
-  }
+  await releaseLease(leaseKey, 'explicit close', true);
   return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
 }
 
@@ -2417,35 +2404,16 @@ async function handleWaitDownload(cmd: Command): Promise<Result> {
   }
 }
 
-async function releaseOwnedLeaseForExplicitClose(leaseKey: string): Promise<void> {
-  const session = automationSessions.get(leaseKey);
-  if (!session) {
-    return;
-  }
-
-  const tabId = session.preferredTabId;
-  if (tabId === null) return;
-
-  try {
-    await chrome.debugger.detach({ tabId });
-  } catch (err) {
-    throw new Error(err instanceof Error ? err.message : `Failed to detach tab ${tabId}`);
-  }
-  identity.evictTab(tabId);
-
-  try {
-    await chrome.tabs.remove(tabId);
-  } catch (err) {
-    throw new Error(err instanceof Error ? err.message : `Failed to remove tab ${tabId}`);
-  }
-  console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, explicit close)`);
-
-  automationSessions.delete(leaseKey);
-  sessionOverrides.delete(leaseKey);
-  await persistRuntimeState();
-}
-
-async function releaseLease(leaseKey: string, reason: string = 'released'): Promise<void> {
+/**
+ * Release a lease. The last owned tab in a container becomes a reusable placeholder
+ * (marked idle.html for interactive single-tab windows) instead of closing the window.
+ *
+ * @param leaseKey - Lease to release.
+ * @param reason - Log label for why the lease ended.
+ * @param replaceTab - Swap the used page for a fresh placeholder tab instead of navigating it,
+ *   so the page's beforeunload guard can't block teardown. Used for explicit close.
+ */
+async function releaseLease(leaseKey: string, reason: string = 'released', replaceTab = false): Promise<void> {
   const session = automationSessions.get(leaseKey);
   if (!session) {
     sessionOverrides.delete(leaseKey);
@@ -2476,8 +2444,18 @@ async function releaseLease(leaseKey: string, reason: string = 'released'): Prom
           const role = getOwnedWindowRole(leaseKey);
           const idleUrl = role === 'interactive'
             ? await parkIdleInteractiveTab(tabId, session.windowId) : null;
-          const tab = await chrome.tabs.update(tabId, { url: idleUrl ?? BLANK_PAGE, active: true });
-          const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), session.windowId, [tab.id ?? tabId]);
+          const placeholderUrl = idleUrl ?? BLANK_PAGE;
+          let placeholderId = tabId;
+          if (replaceTab) {
+            // Navigating the used page runs its beforeunload guard, which can block
+            // teardown on a Chrome prompt (#2163). Swap in a fresh tab instead, grouped
+            // before the old one goes so the group never empties and gets saved.
+            placeholderId = (await chrome.tabs.create({ windowId: session.windowId, url: placeholderUrl, active: true })).id ?? tabId;
+          } else {
+            placeholderId = (await chrome.tabs.update(tabId, { url: placeholderUrl, active: true })).id ?? tabId;
+          }
+          const group = await ensureOwnedContainerGroup(role, session.windowId, [placeholderId]);
+          if (placeholderId !== tabId) await chrome.tabs.remove(tabId);
           if (group) session.windowId = group.windowId;
           console.log(`[opencli] Released owned tab lease ${tabId} as reusable placeholder (session=${session.session}, surface=${session.surface}, ${reason})`);
         } catch {

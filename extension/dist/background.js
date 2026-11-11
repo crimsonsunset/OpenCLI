@@ -2916,7 +2916,7 @@ async function handleCloseWindow(cmd, leaseKey) {
     });
   }
   const sessionName = automationSessions.get(leaseKey)?.session ?? getSessionFromKey(leaseKey);
-  await releaseLease(leaseKey, "explicit close");
+  await releaseLease(leaseKey, "explicit close", true);
   return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
 }
 async function handleSetFileInput(cmd, leaseKey) {
@@ -2973,7 +2973,7 @@ async function handleWaitDownload(cmd) {
     return errorResult(cmd.id, err);
   }
 }
-async function releaseLease(leaseKey, reason = "released") {
+async function releaseLease(leaseKey, reason = "released", replaceTab = false) {
   const session = automationSessions.get(leaseKey);
   if (!session) {
     sessionOverrides.delete(leaseKey);
@@ -2999,8 +2999,15 @@ async function releaseLease(leaseKey, reason = "released") {
         try {
           const role = getOwnedWindowRole(leaseKey);
           const idleUrl = role === "interactive" ? await parkIdleInteractiveTab(tabId, session.windowId) : null;
-          const tab = await chrome.tabs.update(tabId, { url: idleUrl ?? BLANK_PAGE, active: true });
-          const group = await ensureOwnedContainerGroup(getOwnedWindowRole(leaseKey), session.windowId, [tab.id ?? tabId]);
+          const placeholderUrl = idleUrl ?? BLANK_PAGE;
+          let placeholderId = tabId;
+          if (replaceTab) {
+            placeholderId = (await chrome.tabs.create({ windowId: session.windowId, url: placeholderUrl, active: true })).id ?? tabId;
+          } else {
+            placeholderId = (await chrome.tabs.update(tabId, { url: placeholderUrl, active: true })).id ?? tabId;
+          }
+          const group = await ensureOwnedContainerGroup(role, session.windowId, [placeholderId]);
+          if (placeholderId !== tabId) await chrome.tabs.remove(tabId);
           if (group) session.windowId = group.windowId;
           console.log(`[opencli] Released owned tab lease ${tabId} as reusable placeholder (session=${session.session}, surface=${session.surface}, ${reason})`);
         } catch {
