@@ -10,7 +10,13 @@ declare const __OPENCLI_COMPAT_RANGE__: string;
 import { callChrome, describeChrome, ChromeApiError } from './chrome-api';
 import type { Command, Result } from './protocol';
 import { DAEMON_HOST, DAEMON_PORT, DAEMON_WS_URL, DAEMON_PING_URL } from './protocol';
-import { findIdleInteractiveGroup, idlePlaceholderUrl, parkIdleInteractiveTab, consumeIdlePlaceholder } from './idle-container';
+import {
+  findIdleInteractiveGroup,
+  idlePlaceholderUrl,
+  parkIdleInteractiveTab,
+  consumeIdlePlaceholder,
+  clearIdlePlaceholderForWindow,
+} from './idle-container';
 import * as executor from './cdp';
 import * as identity from './identity';
 import { executeWithJournal } from './journal';
@@ -406,6 +412,8 @@ function setSessionOverride(key: string, patch: SessionOverrides): void {
 const activeCommandCounts = new Map<string, number>();
 const closingLeases = new Set<string>();
 const closingTabs = new Set<number>();
+/** Roles whose owned container is mid-close; blocks new commands on that surface. */
+const closingOwnedRoles = new Set<OwnedWindowRole>();
 const LEASE_KEY_SEPARATOR = '\u0000';
 
 function getLeaseKey(session: string, surface: BrowserSurface): string {
@@ -1408,23 +1416,48 @@ chrome.windows.onRemoved.addListener(async (windowId) => {
   // A window-close event can wake the worker before recovery; persisting the
   // empty pre-recovery snapshot here would wipe the registry.
   await workerReady;
-  for (const container of Object.values(ownedContainers)) {
+  await forgetClosedWindow(windowId);
+});
+
+/**
+ * Drop every container pointer and lease that lives in a window that is gone
+ * or being abandoned. Leases are matched by their tab's live window, not just
+ * the cached windowId: a group or tab dragged out of this window is re-pointed
+ * at its live window, and a tab dragged into it (stale cache elsewhere) is
+ * dropped so no later command reuses a window stuck closing.
+ * @param windowId - Window that was closed or abandoned
+ */
+async function forgetClosedWindow(windowId: number): Promise<void> {
+  for (const role of ['automation', 'interactive'] as const) {
+    const container = ownedContainers[role];
     if (container.windowId === windowId) {
-      container.windowId = null;
-      container.groupId = null;
+      const movedGroup = container.groupId === null
+        ? null
+        : await chrome.tabGroups.get(container.groupId).catch(() => null);
+      const isGroupElsewhere = movedGroup !== null && movedGroup.windowId !== windowId;
+      container.windowId = isGroupElsewhere ? movedGroup.windowId : null;
+      if (!isGroupElsewhere) container.groupId = null;
     }
   }
   for (const [leaseKey, session] of automationSessions.entries()) {
-    if (session.windowId === windowId) {
-      console.log(`[opencli] ${session.surface} container closed (session=${session.session})`);
-      if (session.idleTimer) clearTimeout(session.idleTimer);
-      automationSessions.delete(leaseKey);
-      sessionOverrides.delete(leaseKey);
-      scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
+    const liveTab = session.preferredTabId === null
+      ? null
+      : await chrome.tabs.get(session.preferredTabId).catch(() => null);
+    // A bind may have replaced this lease while the lookup was in flight.
+    if (automationSessions.get(leaseKey) !== session) continue;
+    const liveWindowId = liveTab?.windowId ?? session.windowId;
+    if (liveWindowId !== windowId) {
+      session.windowId = liveWindowId;
+      continue;
     }
+    console.log(`[opencli] ${session.surface} container closed (session=${session.session})`);
+    if (session.idleTimer) clearTimeout(session.idleTimer);
+    automationSessions.delete(leaseKey);
+    sessionOverrides.delete(leaseKey);
+    scheduleIdleAlarm(leaseKey, IDLE_TIMEOUT_NONE);
   }
   await persistRuntimeState();
-});
+}
 
 // Evict identity mappings when tabs are closed
 chrome.tabs.onRemoved.addListener(async (tabId) => {
@@ -1592,11 +1625,22 @@ async function handleCommand(cmd: Command): Promise<Result> {
       ) }));
     } catch (error) { return errorResult(cmd.id, error); }
   }
+  // Acts on the containers every session shares, so it has no session of its own.
+  if (cmd.action === 'close-owned-windows') {
+    try {
+      return await handleCloseOwnedWindows(cmd);
+    } catch (err) {
+      return errorResult(cmd.id, err);
+    }
+  }
   const session = getSessionName(cmd.session);
   const surface = getCommandSurface(cmd);
   const leaseKey = getLeaseKey(session, surface);
   if (closingLeases.has(leaseKey)) {
     return errorResult(cmd.id, new CommandFailure('session_busy', 'This session is closing; retry after cleanup finishes.'));
+  }
+  if (closingOwnedRoles.has(getOwnedWindowRole(leaseKey)) && !isBoundOutsideContainer(leaseKey, cmd)) {
+    return errorResult(cmd.id, new CommandFailure('session_busy', 'OpenCLI is closing this window; retry after cleanup finishes.'));
   }
   if (cmd.windowMode === 'foreground' || cmd.windowMode === 'background') {
     setSessionOverride(leaseKey, { windowMode: cmd.windowMode });
@@ -2459,6 +2503,254 @@ async function handleCloseWindow(cmd: Command, leaseKey: string): Promise<Result
   return { id: cmd.id, ok: true, data: { closed: true, session: sessionName } };
 }
 
+let ownedWindowCloseTimeoutMs = 5_000;
+
+type OwnedWindowCloseReport = {
+  closed: Array<{ role: OwnedWindowRole; windowId: number; tabs: number }>;
+  kept: Array<{ role: OwnedWindowRole; windowId: number; reason: 'busy' | 'user_tabs' | 'close_blocked'; closedTabs?: number }>;
+};
+
+/**
+ * Close the windows opencli opened in this profile, for a caller that is done
+ * with the browser (a scheduled run's teardown). No release path does this on
+ * its own: the next command would open a new window in front of the user, so a
+ * container closes only when asked.
+ *
+ * A container is left alone while a command on its surface is still executing.
+ * Only opencli's tabs go. The adapter window is closed whole: opencli creates it
+ * and never adopts a user window for that role. The browser-session container
+ * removes leased tabs and idle placeholders only; that group can converge into
+ * a user window, and the user's other tabs there stay open. Group membership or
+ * a bare about:blank is not ownership evidence.
+ * Chrome closes a window together with its last tab. A window that is still
+ * open when the close deadline passes (a "Leave site?" prompt) is reported as
+ * close_blocked and abandoned, so later commands open a fresh container instead
+ * of reusing a window that may still close under them.
+ * @param cmd - Incoming close-owned-windows command
+ */
+async function handleCloseOwnedWindows(cmd: Command): Promise<Result> {
+  return withLeaseMutation(async () => {
+    const report: OwnedWindowCloseReport = { closed: [], kept: [] };
+    for (const role of ['automation', 'interactive'] as const) {
+      const container = ownedContainers[role];
+      // Interactive groups can move windows; resolve before treating a null or
+      // stale container.windowId as "nothing to close".
+      if (role === 'interactive') {
+        await ensureOwnedContainerGroup(role, container.windowId, []);
+      }
+      const windowId = container.windowId;
+      if (windowId === null) continue;
+
+      // Reserve before any further await so admission rejects new commands on
+      // this role; withLeaseMutation alone does not cover their full execution.
+      closingOwnedRoles.add(role);
+      try {
+        if (hasOwnedCommandOnRole(role)) {
+          report.kept.push({ role, windowId, reason: 'busy' });
+          continue;
+        }
+        let tabs: chrome.tabs.Tab[];
+        try {
+          await chrome.windows.get(windowId);
+          tabs = await chrome.tabs.query({ windowId });
+        } catch {
+          await forgetClosedWindow(windowId);
+          continue;
+        }
+        // A command may have started between the first busy check and these
+        // lookups; abort before removing anything.
+        if (hasOwnedCommandOnRole(role)) {
+          report.kept.push({ role, windowId, reason: 'busy' });
+          continue;
+        }
+        // Role-based busy checks miss a command whose tab was dragged in from the
+        // other owned surface, or a bound command sharing an owned lease's tab.
+        // Re-check by live membership before removing tabs or the window.
+        if (await windowHasActiveCommandTabs(windowId)) {
+          report.kept.push({ role, windowId, reason: 'busy' });
+          continue;
+        }
+        const idleUrl = role === 'interactive' ? await idlePlaceholderUrl() : null;
+        const ownedIds = new Set<number>();
+        for (const tab of tabs) {
+          if (tab.id === undefined) continue;
+          if (role === 'automation' || isOwnedInteractiveTab(tab, idleUrl)) ownedIds.add(tab.id);
+        }
+        if (ownedIds.size < tabs.length) {
+          const closedTabs = ownedIds.size > 0
+            ? await removeOwnedTabsConfirmed([...ownedIds])
+            : 0;
+          if (closedTabs < ownedIds.size) {
+            // Keep container pointers so a later close can retry remaining tabs.
+            await persistRuntimeState();
+            report.kept.push({ role, windowId, reason: 'close_blocked', closedTabs });
+            continue;
+          }
+          // The window is the user's; drop group ownership so survivors are not
+          // re-adopted by a later ensureOwnedContainerGroup convergence.
+          const retiredGroupId = container.groupId;
+          const survivorIds = tabs
+            .filter((tab) => tab.id !== undefined && !ownedIds.has(tab.id)
+              && retiredGroupId !== null && tab.groupId === retiredGroupId)
+            .map((tab) => tab.id!);
+          await retireInteractiveGroupOwnership(retiredGroupId, survivorIds);
+          container.windowId = null;
+          container.groupId = null;
+          await persistRuntimeState();
+          report.kept.push({ role, windowId, reason: 'user_tabs', closedTabs });
+          continue;
+        }
+        // `chrome.windows.remove` resolving is not proof: Edge kept answering
+        // `windows.get` for a few hundred ms after a window it had closed
+        // (measured 2026-09-17, which made every normal close report as blocked).
+        // Poll until the window is really gone, and let its own promise settle.
+        void chrome.windows.remove(windowId).catch(() => {});
+        if (!await windowClosedBefore(windowId, Date.now() + ownedWindowCloseTimeoutMs)) {
+          report.kept.push({ role, windowId, reason: 'close_blocked' });
+          // A "Leave site?" prompt may close this window later or never; Chrome
+          // can't tell us which. Abandon it so no command reuses a closing window.
+          await abandonOwnedWindow(role, windowId);
+          continue;
+        }
+        await forgetClosedWindow(windowId);
+        console.log(`[opencli] Closed owned ${role} window ${windowId} (${tabs.length} tabs, explicit close)`);
+        report.closed.push({ role, windowId, tabs: tabs.length });
+      } finally {
+        closingOwnedRoles.delete(role);
+      }
+    }
+    return { id: cmd.id, ok: true, data: report };
+  });
+}
+
+/**
+ * Remove ledger ownership and ungroup surviving user tabs for a retired
+ * interactive group so ensureOwnedContainerGroup cannot adopt it again.
+ * @param groupId - Group id to retire, or null when none was tracked
+ * @param survivorTabIds - Tabs still open that may remain in that group
+ */
+async function retireInteractiveGroupOwnership(
+  groupId: number | null,
+  survivorTabIds: number[],
+): Promise<void> {
+  if (groupId === null) return;
+  interactiveGroupLedger.delete(groupId);
+  if (survivorTabIds.length === 0) return;
+  try {
+    await chrome.tabs.ungroup(survivorTabIds);
+  } catch {
+    // Group may already be gone after owned-tab removal.
+  }
+}
+
+/**
+ * Give up ownership of a window whose close is stuck on a "Leave site?" prompt.
+ * The prompt can resolve at any time or never, so instead of reserving the role
+ * until an outcome Chrome can't report, drop the container pointer, group ledger
+ * entry, leases, and any idle-placeholder recovery token still pointing at this
+ * window. The next command opens a fresh container; if the user picks Stay, the
+ * window stays open as theirs.
+ * @param role - Owned surface whose container is being abandoned
+ * @param windowId - Window still waiting on its close prompt
+ */
+async function abandonOwnedWindow(role: OwnedWindowRole, windowId: number): Promise<void> {
+  if (role === 'interactive') {
+    await retireInteractiveGroupOwnership(ownedContainers.interactive.groupId, []);
+    ownedContainers.interactive.groupId = null;
+    await clearIdlePlaceholderForWindow(windowId);
+  }
+  await forgetClosedWindow(windowId);
+}
+
+/**
+ * Whether a command on this role is running against OpenCLI's own container,
+ * or hasn't resolved its target yet. Borrowed (bound) sessions are skipped;
+ * windowHasActiveCommandTabs still guards any that sit in the window.
+ * @param role - Owned surface being closed
+ */
+function hasOwnedCommandOnRole(role: OwnedWindowRole): boolean {
+  return [...activeCommandCounts.keys()].some((leaseKey) =>
+    getOwnedWindowRole(leaseKey) === role && automationSessions.get(leaseKey)?.kind !== 'bound');
+}
+
+/**
+ * Whether a command targets a borrowed tab outside its role's owned container,
+ * so that container closing can't affect it. Rebinds stay blocked because they
+ * may pick a tab inside the closing window.
+ * @param leaseKey - Lease the command runs on
+ * @param cmd - Incoming command
+ */
+function isBoundOutsideContainer(leaseKey: string, cmd: Command): boolean {
+  if (cmd.action === 'bind') return false;
+  const lease = automationSessions.get(leaseKey);
+  if (lease?.kind !== 'bound') return false;
+  return lease.windowId !== ownedContainers[getOwnedWindowRole(leaseKey)].windowId;
+}
+
+/**
+ * Whether any in-flight command currently owns a tab living in `windowId`.
+ * Role-scoped busy checks miss tabs the user dragged across owned surfaces.
+ * @param windowId - Window about to be removed wholesale
+ */
+async function windowHasActiveCommandTabs(windowId: number): Promise<boolean> {
+  for (const leaseKey of activeCommandCounts.keys()) {
+    const session = automationSessions.get(leaseKey);
+    if (session?.preferredTabId === null || session?.preferredTabId === undefined) continue;
+    const tab = await chrome.tabs.get(session.preferredTabId).catch(() => null);
+    if (tab?.windowId === windowId) return true;
+  }
+  return false;
+}
+
+/**
+ * Remove owned tabs and return how many are confirmed gone.
+ * Retains ownership state for any tab that is still open after a failed or
+ * partial chrome.tabs.remove.
+ * @param tabIds - Tab ids previously classified as OpenCLI-owned
+ */
+async function removeOwnedTabsConfirmed(tabIds: number[]): Promise<number> {
+  if (tabIds.length === 0) return 0;
+  try {
+    await chrome.tabs.remove(tabIds);
+  } catch {
+    // Fall through to confirmation; Chrome may have removed a subset.
+  }
+  let closed = 0;
+  for (const tabId of tabIds) {
+    const stillOpen = await chrome.tabs.get(tabId).then(() => true, () => false);
+    if (!stillOpen) closed += 1;
+  }
+  return closed;
+}
+
+/** Poll until the window is gone, because a resolved `windows.remove` is not proof. */
+async function windowClosedBefore(windowId: number, deadline: number): Promise<boolean> {
+  for (;;) {
+    const open = await chrome.windows.get(windowId).then(() => true, () => false);
+    if (!open) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/**
+ * Whether a tab in a mixed interactive window is safe to delete on windows close.
+ * Requires a recorded owned lease or the current idle-placeholder URL; group
+ * membership and bare about:blank are not ownership evidence.
+ * @param tab - Candidate tab in the container window
+ * @param idleUrl - Current tokenized idle placeholder URL, or null when none
+ */
+function isOwnedInteractiveTab(tab: chrome.tabs.Tab, idleUrl: string | null): boolean {
+  for (const [leaseKey, session] of automationSessions.entries()) {
+    if (session.owned && session.preferredTabId === tab.id
+      && getOwnedWindowRole(leaseKey) === 'interactive') {
+      return true;
+    }
+  }
+  if (idleUrl && tab.url === idleUrl && !tab.pendingUrl) return true;
+  return false;
+}
+
 async function handleSetFileInput(cmd: Command, leaseKey: string): Promise<Result> {
   if (!cmd.files || !Array.isArray(cmd.files) || cmd.files.length === 0) {
     return { id: cmd.id, ok: false, error: 'Missing or empty files array' };
@@ -2705,6 +2997,7 @@ export const __test__ = {
   resolveTabId,
   resetWindowIdleTimer,
   handleCommand,
+  handleCloseOwnedWindows,
   getSessionName,
   getCommandSurface,
   getIdleTimeout,
@@ -2732,6 +3025,11 @@ export const __test__ = {
     wsKeepaliveSocket = null;
     connectInFlight = null;
     ws = null;
+  },
+  setOwnedWindowCloseTimeoutMs: (ms: number) => { ownedWindowCloseTimeoutMs = ms; },
+  setActiveCommandCount: (leaseKey: string, count: number) => {
+    if (count > 0) activeCommandCounts.set(leaseKey, count);
+    else activeCommandCounts.delete(leaseKey);
   },
   getSession: (leaseKey: string = 'default') => automationSessions.get(leaseKey) ?? null,
   getAutomationWindowId: (leaseKey: string = 'default') => automationSessions.get(leaseKey)?.windowId ?? null,
