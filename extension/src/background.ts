@@ -934,16 +934,47 @@ async function ensureOwnedContainerGroup(
   return trackedGroupPromise;
 }
 
+/**
+ * Ungroup owned interactive tab groups selected from ownership evidence
+ * (cache, session ledger, owned leases, idle placeholder), not by title.
+ * Retains ownership for any group that fails to ungroup and throws so callers
+ * do not report cleanup success while live groups remain.
+ */
 async function removeOwnedBrowserTabGroups(): Promise<void> {
   const container = ownedContainers.interactive;
   const pendingGroup = container.groupPromise;
   if (pendingGroup) await pendingGroup.catch(() => null);
 
-  const groups = await chrome.tabGroups.query({ title: CONTAINER_TAB_GROUP_TITLE.interactive }).catch(() => []);
-  for (const group of groups) {
-    const tabs = await chrome.tabs.query({ groupId: group.id }).catch(() => []);
-    const tabIds = tabs.map((tab) => tab.id).filter((id): id is number => id !== undefined);
-    if (tabIds.length > 0) await chrome.tabs.ungroup(tabIds).catch(() => {});
+  const candidates = await collectOwnedGroupCandidates('interactive');
+  const failedGroupIds = new Set<number>();
+
+  for (const group of candidates) {
+    let tabIds: number[];
+    try {
+      const tabs = await chrome.tabs.query({ groupId: group.id });
+      tabIds = tabs.map((tab) => tab.id).filter((id): id is number => id !== undefined);
+    } catch {
+      failedGroupIds.add(group.id);
+      continue;
+    }
+    if (tabIds.length === 0) continue;
+    try {
+      await chrome.tabs.ungroup(tabIds);
+    } catch {
+      failedGroupIds.add(group.id);
+    }
+  }
+
+  if (failedGroupIds.size > 0) {
+    for (const id of [...interactiveGroupLedger]) {
+      if (!failedGroupIds.has(id)) interactiveGroupLedger.delete(id);
+    }
+    for (const id of failedGroupIds) interactiveGroupLedger.add(id);
+    if (container.groupId === null || !failedGroupIds.has(container.groupId)) {
+      container.groupId = [...failedGroupIds][0] ?? null;
+    }
+    await persistRuntimeState();
+    throw new Error(`Failed to ungroup ${failedGroupIds.size} owned tab group(s)`);
   }
 
   container.groupId = null;
@@ -951,10 +982,16 @@ async function removeOwnedBrowserTabGroups(): Promise<void> {
   await persistRuntimeState();
 }
 
+/**
+ * Persist the browser tab-grouping preference. When disabling, ungroup owned
+ * interactive groups first so a failed cleanup does not flip the stored
+ * preference while live groups remain.
+ * @param enabled - Whether new interactive tabs should join an owned group
+ */
 async function setBrowserTabGroupingEnabled(enabled: boolean): Promise<void> {
+  if (!enabled) await withLeaseMutation(removeOwnedBrowserTabGroups);
   await chrome.storage?.local?.set?.({ [BROWSER_TAB_GROUPS_ENABLED_KEY]: enabled });
   browserTabGroupingEnabled = enabled;
-  if (!enabled) await withLeaseMutation(removeOwnedBrowserTabGroups);
 }
 
 async function ensureOwnedContainerGroupUnlocked(
@@ -1019,6 +1056,15 @@ async function ensureOwnedContainerWindow(
   return container.promise;
 }
 
+/**
+ * Create or reuse the owned window for a role. When grouping is enabled for
+ * interactive sessions, a missing group means the cached window is abandoned.
+ * When grouping is disabled (or the role is automation), a valid window is
+ * reused without requiring a tab group.
+ * @param role - Interactive browser surface or background adapter surface
+ * @param initialUrl - Optional first-tab URL when a new window must be created
+ * @param mode - Foreground focuses the window; background keeps it in the back
+ */
 async function ensureOwnedContainerWindowUnlocked(
   role: OwnedWindowRole,
   initialUrl?: string,
@@ -1046,10 +1092,10 @@ async function ensureOwnedContainerWindowUnlocked(
           initialTabId,
         };
       }
-      if (role === 'interactive') {
-        container.windowId = null;
-        container.groupId = null;
-      } else {
+      // Automation never groups. Interactive also runs ungrouped when the user
+      // disabled browser tab grouping — reuse the still-valid window instead of
+      // treating a missing group as a missing container.
+      if (role === 'automation' || !browserTabGroupingEnabled) {
         await focusOwnedWindowIfRequested(windowId, mode);
         const initialTabId = await findReusableOwnedContainerTab(windowId, null);
         return {
@@ -1057,6 +1103,8 @@ async function ensureOwnedContainerWindowUnlocked(
           initialTabId,
         };
       }
+      container.windowId = null;
+      container.groupId = null;
     }
   }
 
