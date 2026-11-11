@@ -1559,6 +1559,37 @@ describe('background tab isolation', () => {
     expect(chrome.windows.create).not.toHaveBeenCalled();
   });
 
+  it('does not hand a pending close placeholder to another session that a failed close then deletes', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs.push({ id: 70, windowId: 7, url: 'https://automation.example', active: true, status: 'complete', groupId: 400 });
+    groups.push({ id: 400, windowId: 7, title: 'OpenCLI Browser', color: 'orange', collapsed: false });
+    let failUsedTabRemoval: ((err: Error) => void) | null = null;
+    chrome.tabs.remove.mockImplementation(async (tabId: number) => {
+      if (tabId === 70 && !failUsedTabRemoval) return new Promise<void>((_, reject) => { failUsedTabRemoval = reject; });
+      if (tabId === 70) throw new Error('Tab is locked');
+      tabs.splice(tabs.findIndex(tab => tab.id === tabId), 1);
+    });
+    chrome.tabs.get.mockImplementation(async (tabId: number) => {
+      const tab = tabs.find(candidate => candidate.id === tabId);
+      if (!tab) throw new Error(`No tab with id: ${tabId}`);
+      return tab;
+    });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    mod.__test__.setSession(browserKey('stuck'), { windowId: 7, owned: true, preferredTabId: 70 });
+
+    const close = mod.__test__.handleCommand({ id: 'close', action: 'close-window', session: 'stuck', surface: 'browser' });
+    await vi.waitFor(() => expect(chrome.tabs.remove).toHaveBeenCalledWith(70));
+    const placeholderId = (await chrome.tabs.create.mock.results.at(-1)?.value)?.id;
+    const otherTabId = await mod.__test__.resolveTabId(undefined, browserKey('other'), 'https://other.example');
+    expect(otherTabId).not.toBe(placeholderId);
+
+    failUsedTabRemoval!(new Error('Tab is locked'));
+    expect(await close).toEqual(expect.objectContaining({ ok: false }));
+    expect(tabs.some(tab => tab.id === otherTabId)).toBe(true);
+  });
+
   it('opts into closing only the owned tab, preserving user pages and other sessions', async () => {
     const { chrome, tabs } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

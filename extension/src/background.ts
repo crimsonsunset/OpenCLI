@@ -339,6 +339,10 @@ const ownedContainers: Record<OwnedWindowRole, {
 // StoredRegistry) and restored by reconcileTargetLeaseRegistry().
 const interactiveGroupLedger = new Set<number>();
 
+// Replacement placeholders created by an explicit close, held until the used tab is
+// removed so another session can't claim one that a failed close then deletes.
+const pendingPlaceholderTabs = new Set<number>();
+
 type StoredLease = Omit<TargetLease, 'idleTimer' | 'idleDeadlineAt'> & {
   idleDeadlineAt: number;
   updatedAt: number;
@@ -787,6 +791,7 @@ async function collectOwnedGroupCandidates(role: OwnedWindowRole): Promise<Owned
   if (groupsById.size === 0) {
     const reservedTabs = new Set([...automationSessions.values()]
       .flatMap(session => session.preferredTabId === null ? [] : [session.preferredTabId]));
+    pendingPlaceholderTabs.forEach(tabId => reservedTabs.add(tabId));
     const idleGroup = await findIdleInteractiveGroup(reservedTabs);
     if (idleGroup) groupsById.set(idleGroup.id, idleGroup);
   }
@@ -1099,9 +1104,17 @@ async function findReusableOwnedContainerTab(windowId: number, ownedGroupId?: nu
   return reusable?.id;
 }
 
+/**
+ * Check whether a tab can be claimed as a session's initial tab.
+ *
+ * @param tabId - Candidate tab.
+ * @returns False for poisoned tabs, tabs leased by an owned session, or replacement
+ *   placeholders still pending in an explicit close.
+ */
 function initialTabIsAvailable(tabId: number | undefined): tabId is number {
   if (tabId === undefined) return false;
   if (executor.isTabPoisoned(tabId)) return false;
+  if (pendingPlaceholderTabs.has(tabId)) return false;
   for (const session of automationSessions.values()) {
     if (session.owned && session.preferredTabId === tabId) return false;
   }
@@ -2452,6 +2465,7 @@ async function releaseLease(leaseKey: string, reason: string = 'released', repla
             // teardown on a Chrome prompt (#2163). Swap in a fresh tab instead, grouped
             // before the old one goes so the group never empties and gets saved.
             placeholderId = (await chrome.tabs.create({ windowId: session.windowId, url: placeholderUrl, active: true })).id ?? tabId;
+            pendingPlaceholderTabs.add(placeholderId);
           } else {
             placeholderId = (await chrome.tabs.update(tabId, { url: placeholderUrl, active: true })).id ?? tabId;
           }
@@ -2471,6 +2485,8 @@ async function releaseLease(leaseKey: string, reason: string = 'released', repla
             throw new Error(`Failed to remove owned tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`);
           }
           console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
+        } finally {
+          pendingPlaceholderTabs.delete(placeholderId);
         }
       }
     } else {

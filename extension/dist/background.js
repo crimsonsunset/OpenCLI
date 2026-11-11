@@ -1392,6 +1392,7 @@ const ownedContainers = {
   automation: { windowId: null, groupId: null, promise: null, groupPromise: null }
 };
 const interactiveGroupLedger = /* @__PURE__ */ new Set();
+const pendingPlaceholderTabs = /* @__PURE__ */ new Set();
 class CommandFailure extends Error {
   constructor(code, message, hint) {
     super(message);
@@ -1713,6 +1714,7 @@ async function collectOwnedGroupCandidates(role) {
   }
   if (groupsById.size === 0) {
     const reservedTabs = new Set([...automationSessions.values()].flatMap((session) => session.preferredTabId === null ? [] : [session.preferredTabId]));
+    pendingPlaceholderTabs.forEach((tabId) => reservedTabs.add(tabId));
     const idleGroup = await findIdleInteractiveGroup(reservedTabs);
     if (idleGroup) groupsById.set(idleGroup.id, idleGroup);
   }
@@ -1936,6 +1938,7 @@ async function findReusableOwnedContainerTab(windowId, ownedGroupId) {
 function initialTabIsAvailable(tabId) {
   if (tabId === void 0) return false;
   if (isTabPoisoned(tabId)) return false;
+  if (pendingPlaceholderTabs.has(tabId)) return false;
   for (const session of automationSessions.values()) {
     if (session.owned && session.preferredTabId === tabId) return false;
   }
@@ -3003,6 +3006,7 @@ async function releaseLease(leaseKey, reason = "released", replaceTab = false) {
           const placeholderUrl = idleUrl ?? BLANK_PAGE;
           if (replaceTab) {
             placeholderId = (await chrome.tabs.create({ windowId: session.windowId, url: placeholderUrl, active: true })).id ?? tabId;
+            pendingPlaceholderTabs.add(placeholderId);
           } else {
             placeholderId = (await chrome.tabs.update(tabId, { url: placeholderUrl, active: true })).id ?? tabId;
           }
@@ -3021,6 +3025,8 @@ async function releaseLease(leaseKey, reason = "released", replaceTab = false) {
             throw new Error(`Failed to remove owned tab ${tabId}: ${err instanceof Error ? err.message : String(err)}`);
           }
           console.log(`[opencli] Released owned tab lease ${tabId} (session=${session.session}, surface=${session.surface}, ${reason})`);
+        } finally {
+          pendingPlaceholderTabs.delete(placeholderId);
         }
       }
     } else {
