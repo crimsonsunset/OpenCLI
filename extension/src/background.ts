@@ -985,13 +985,17 @@ async function removeOwnedBrowserTabGroups(): Promise<void> {
 /**
  * Persist the browser tab-grouping preference. When disabling, ungroup owned
  * interactive groups first so a failed cleanup does not flip the stored
- * preference while live groups remain.
+ * preference while live groups remain. Cleanup, storage write, and the
+ * in-memory flag update run inside withLeaseMutation so a queued tab
+ * allocation cannot recreate a group before the disabled state takes effect.
  * @param enabled - Whether new interactive tabs should join an owned group
  */
 async function setBrowserTabGroupingEnabled(enabled: boolean): Promise<void> {
-  if (!enabled) await withLeaseMutation(removeOwnedBrowserTabGroups);
-  await chrome.storage?.local?.set?.({ [BROWSER_TAB_GROUPS_ENABLED_KEY]: enabled });
-  browserTabGroupingEnabled = enabled;
+  await withLeaseMutation(async () => {
+    if (!enabled) await removeOwnedBrowserTabGroups();
+    await chrome.storage?.local?.set?.({ [BROWSER_TAB_GROUPS_ENABLED_KEY]: enabled });
+    browserTabGroupingEnabled = enabled;
+  });
 }
 
 async function ensureOwnedContainerGroupUnlocked(
