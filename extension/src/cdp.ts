@@ -373,14 +373,10 @@ export async function ensureAttached(tabId: number, aggressiveRetry: boolean = f
   attached.add(tabId);
   poisonedTabs.delete(tabId);
 
-  try {
-    console.log(`[opencli:attach] Runtime.enable begin tab=${tabId}`);
-    await sendDebuggerCommand({ tabId }, 'Runtime.enable');
-    console.log(`[opencli:attach] Runtime.enable ok tab=${tabId}`);
-  } catch (enableErr) {
-    const enableMsg = enableErr instanceof Error ? enableErr.message : String(enableErr);
-    console.warn(`[opencli:attach] Runtime.enable failed tab=${tabId}: ${enableMsg}`);
-  }
+  // No Runtime.enable here. Runtime.evaluate without a contextId works with the
+  // domain off, and enabling it on attach is the CDP tell anti-bot scripts score
+  // (DataDome, Cloudflare; rebrowser "runtimeEnableLeak"). evaluateInFrame enables
+  // it on demand because it needs executionContextCreated ids for frames.
 
   // Restore network capture that the re-attach (detach + onDetach) tore down.
   // The detach always disables the CDP Network domain, so re-enable it and put
