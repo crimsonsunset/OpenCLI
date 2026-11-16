@@ -63,6 +63,18 @@ describe('cdp attach recovery', () => {
     expect(scripting.executeScript).not.toHaveBeenCalled();
   });
 
+  it('does not send Runtime.enable for a plain evaluate (anti-bot CDP tell)', async () => {
+    const { chrome, debuggerApi } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./cdp');
+    await mod.evaluate(1, '1');
+
+    const methods = debuggerApi.sendCommand.mock.calls.map((call) => call[1]);
+    expect(methods).toContain('Runtime.evaluate');
+    expect(methods).not.toContain('Runtime.enable');
+  });
+
   it('uses the default execution context for a frame when isolated worlds also exist', async () => {
     const { chrome, debuggerApi, debuggerEventListeners } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

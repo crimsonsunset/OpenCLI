@@ -334,14 +334,6 @@ async function ensureAttached(tabId, aggressiveRetry = false) {
   }
   attached.add(tabId);
   poisonedTabs.delete(tabId);
-  try {
-    console.log(`[opencli:attach] Runtime.enable begin tab=${tabId}`);
-    await sendDebuggerCommand({ tabId }, "Runtime.enable");
-    console.log(`[opencli:attach] Runtime.enable ok tab=${tabId}`);
-  } catch (enableErr) {
-    const enableMsg = enableErr instanceof Error ? enableErr.message : String(enableErr);
-    console.warn(`[opencli:attach] Runtime.enable failed tab=${tabId}: ${enableMsg}`);
-  }
   if (preservedNetworkCapture) {
     try {
       await sendDebuggerCommand({ tabId }, "Network.enable");
@@ -2980,7 +2972,7 @@ const CDP_ALLOWLIST = /* @__PURE__ */ new Set([
   "Page.captureScreenshot",
   "Page.getFrameTree",
   "Page.handleJavaScriptDialog",
-  // Runtime.enable needed for CDP attach setup (Runtime.evaluate goes through 'exec' action)
+  // Runtime.enable stays opt-in for raw callers; attach no longer sends it (anti-bot tell)
   "Runtime.enable",
   // Emulation (used by screenshot full-page)
   "Emulation.setDeviceMetricsOverride",

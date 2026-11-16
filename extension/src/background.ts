@@ -2458,7 +2458,7 @@ const CDP_ALLOWLIST = new Set([
   'Page.captureScreenshot',
   'Page.getFrameTree',
   'Page.handleJavaScriptDialog',
-  // Runtime.enable needed for CDP attach setup (Runtime.evaluate goes through 'exec' action)
+  // Runtime.enable stays opt-in for raw callers; attach no longer sends it (anti-bot tell)
   'Runtime.enable',
   // Emulation (used by screenshot full-page)
   'Emulation.setDeviceMetricsOverride',
