@@ -1416,15 +1416,15 @@ const ownedContainers = {
   automation: { windowId: null, groupId: null, promise: null, groupPromise: null }
 };
 const interactiveGroupLedger = /* @__PURE__ */ new Set();
-let browserTabGroupingEnabled = true;
+let browserTabGroupingEnabled = false;
 async function loadBrowserTabGroupingPreference() {
   try {
     const local = chrome.storage?.local;
     if (!local) return;
     const raw = await local.get(BROWSER_TAB_GROUPS_ENABLED_KEY);
-    browserTabGroupingEnabled = raw[BROWSER_TAB_GROUPS_ENABLED_KEY] !== false;
+    browserTabGroupingEnabled = raw[BROWSER_TAB_GROUPS_ENABLED_KEY] === true;
   } catch {
-    browserTabGroupingEnabled = true;
+    browserTabGroupingEnabled = false;
   }
 }
 const pendingPlaceholderTabs = /* @__PURE__ */ new Set();

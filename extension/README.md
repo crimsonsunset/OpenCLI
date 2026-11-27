@@ -27,10 +27,10 @@ Suggested Chrome Web Store justification for `downloads`:
 
 ## Browser Tab Groups
 
-OpenCLI groups browser-session tabs under `OpenCLI Browser` by default. To keep
-those tabs ungrouped, open the extension popup and turn off **Group browser
-tabs**. The preference is stored in the Chrome profile and takes effect for
-existing live OpenCLI groups as well as future browser sessions.
+This fork keeps browser-session tabs ungrouped by default. To group them under
+`OpenCLI Browser`, open the extension popup and turn on **Group browser tabs**.
+The preference is stored per extension ID, so loading the unpacked extension
+from a new path starts ungrouped again.
 
 Chrome does not expose saved tab groups through the extension API. Turning the
 setting off prevents new saved `OpenCLI Browser` entries, but previously saved

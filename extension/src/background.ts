@@ -345,16 +345,22 @@ const ownedContainers: Record<OwnedWindowRole, {
 // creates a visible group. Persisted as part of the session registry (see
 // StoredRegistry) and restored by reconcileTargetLeaseRegistry().
 const interactiveGroupLedger = new Set<number>();
-let browserTabGroupingEnabled = true;
+// ponytail: fork default is off. Unpacked reloads from a new path get a new
+// extension ID and empty storage, which silently re-enabled grouping.
+let browserTabGroupingEnabled = false;
 
+/**
+ * Load the browser tab-grouping preference. Grouping is opt-in: only an
+ * explicit stored `true` enables it.
+ */
 async function loadBrowserTabGroupingPreference(): Promise<void> {
   try {
     const local = chrome.storage?.local;
     if (!local) return;
     const raw = await local.get(BROWSER_TAB_GROUPS_ENABLED_KEY) as Record<string, unknown>;
-    browserTabGroupingEnabled = raw[BROWSER_TAB_GROUPS_ENABLED_KEY] !== false;
+    browserTabGroupingEnabled = raw[BROWSER_TAB_GROUPS_ENABLED_KEY] === true;
   } catch {
-    browserTabGroupingEnabled = true;
+    browserTabGroupingEnabled = false;
   }
 }
 
