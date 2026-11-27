@@ -11,7 +11,7 @@ chrome.runtime.sendMessage({ type: 'getStatus' }, (resp) => {
   const extVersion = document.getElementById('extVersion');
   const browserTabGrouping = document.getElementById('browserTabGrouping');
 
-  browserTabGrouping.checked = resp?.browserTabGroupingEnabled !== false;
+  browserTabGrouping.checked = resp?.browserTabGroupingEnabled === true;
   browserTabGrouping.disabled = false;
   browserTabGrouping.addEventListener('change', () => {
     const enabled = browserTabGrouping.checked;

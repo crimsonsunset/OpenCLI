@@ -87,7 +87,7 @@ function deferred<T>() {
 function createChromeMock() {
   let nextTabId = 10;
   let nextGroupId = 100;
-  const storageState: Record<string, unknown> = {};
+  const storageState: Record<string, unknown> = { opencli_browser_tab_groups_enabled: true };
   const sessionStorageState: Record<string, unknown> = {};
   const tabs: MockTab[] = [
     { id: 1, windowId: 1, url: 'https://automation.example', title: 'automation', active: true, status: 'complete', groupId: -1 },
@@ -1255,6 +1255,22 @@ describe('background tab isolation', () => {
         contextId: 'abc123xy',
         browserTabGroupingEnabled: false,
       }));
+    });
+  });
+
+  it('defaults browser tab grouping off when the profile has no stored preference', async () => {
+    const { chrome } = createChromeMock();
+    await chrome.storage.local.remove('opencli_browser_tab_groups_enabled');
+    vi.stubGlobal('chrome', chrome);
+
+    await import('./background');
+    const onMessageListener = chrome.runtime.onMessage.addListener.mock.calls[0][0];
+    const sendResponse = vi.fn();
+
+    onMessageListener({ type: 'getStatus' }, {}, sendResponse);
+
+    await vi.waitFor(() => {
+      expect(sendResponse).toHaveBeenCalledWith(expect.objectContaining({ browserTabGroupingEnabled: false }));
     });
   });
 
